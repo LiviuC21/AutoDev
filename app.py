@@ -1,0 +1,630 @@
+"""app.py — AutoDev Studio: interfață PyQt6 (temă dark) care orchestrează Gemini (Arhitect) și Qwen (Muncitor)."""
+from __future__ import annotations
+
+import html
+import sys
+import threading
+import time
+import traceback
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Optional
+
+from PyQt6.QtCore import QSettings, Qt, QThread, pyqtSignal
+from PyQt6.QtGui import QColor, QKeySequence, QPalette, QShortcut, QTextCursor
+from PyQt6.QtWidgets import (
+    QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout,
+    QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMessageBox, QPlainTextEdit, QPushButton,
+    QSplitter, QTextEdit, QVBoxLayout, QWidget,
+)
+
+from agents import AgentError, GeminiArchitect, QwenWorker
+from config import MAX_ATTEMPTS, PROJECT_TYPES, Cancelled, Settings, list_project_files, safe_join
+from github_manager import push_project
+from runner import validate_file
+
+TEXT_SUFFIXES = {
+    ".py", ".kt", ".java", ".xml", ".json", ".txt", ".gradle", ".kts", ".md",
+    ".properties", ".toml", ".cfg", ".ini", ".yml", ".yaml", ".pro",
+}
+MAX_CONTEXT_FILE_BYTES = 20000
+
+COLORS = {
+    "info": "#9aa7b8", "plan": "#c792ea", "task": "#e5c07b", "ok": "#7fd18b",
+    "warn": "#f0a35e", "err": "#f07178", "user": "#61afef", "gemini": "#7fd18b", "sys": "#9aa7b8",
+}
+
+
+# --------------------------------------------------------------------------- #
+# Sesiune (rămâne între mesajele din panoul 1)
+# --------------------------------------------------------------------------- #
+@dataclass
+class Session:
+    architect: Optional[GeminiArchitect] = None
+    api_key: str = ""
+    project_dir: str = ""
+    project_type: str = ""
+    entry_file: str = ""
+    built: bool = False
+
+
+# --------------------------------------------------------------------------- #
+# Worker — toată logica rulează aici, comunică doar prin semnale
+# --------------------------------------------------------------------------- #
+class PipelineWorker(QThread):
+    chat_message = pyqtSignal(str, str)   # (autor, text) -> panoul 1
+    agent_log = pyqtSignal(str, str)      # (text, tip) -> panoul 2
+    code_set = pyqtSignal(str, str)       # (titlu, text) -> panoul 3 sus (înlocuiește)
+    code_chunk = pyqtSignal(str)          # fragment live de la Qwen
+    console = pyqtSignal(str)             # panoul 3 jos
+    finished_run = pyqtSignal(bool, str)  # (reușit, rezumat)
+
+    def __init__(self, settings: Settings, session: Session, mode: str, text: str,
+                 auto_push: bool, cancel: threading.Event) -> None:
+        super().__init__()
+        self.settings = settings
+        self.session = session
+        self.mode = mode
+        self.text = text
+        self.auto_push = auto_push
+        self.cancel = cancel
+        self.project_dir = session.project_dir
+        self.project_type = session.project_type
+        self.qwen = QwenWorker()
+        self._buffer: list[str] = []
+        self._last_flush = 0.0
+
+    # ----- ciclu de viață -------------------------------------------------- #
+    def run(self) -> None:
+        try:
+            problem = self.qwen.check_available()
+            if problem:
+                raise AgentError(problem)
+            if self.mode == "build":
+                ok, summary = self._build()
+            else:
+                ok, summary = self._feedback()
+            self.finished_run.emit(ok, summary)
+        except Cancelled:
+            self.agent_log.emit("⛔ Oprit de utilizator.", "warn")
+            self.console.emit("⛔ Oprit de utilizator.")
+            self.finished_run.emit(False, "Procesul a fost oprit.")
+        except AgentError as exc:
+            self.agent_log.emit(f"✘ {exc}", "err")
+            self.finished_run.emit(False, str(exc))
+        except Exception as exc:  # noqa: BLE001
+            self.console.emit("✘ Eroare neașteptată:\n" + traceback.format_exc())
+            self.finished_run.emit(False, f"Eroare neașteptată: {exc}")
+
+    def _check(self) -> None:
+        if self.cancel.is_set():
+            raise Cancelled()
+
+    # ----- streaming cod --------------------------------------------------- #
+    def _on_token(self, piece: str) -> None:
+        self._buffer.append(piece)
+        if time.monotonic() - self._last_flush >= 0.05:
+            self._flush()
+
+    def _flush(self) -> None:
+        if self._buffer:
+            self.code_chunk.emit("".join(self._buffer))
+            self._buffer.clear()
+        self._last_flush = time.monotonic()
+
+    # ----- citire fișiere -------------------------------------------------- #
+    def _read_files(self, files: list[str], budget: int) -> dict[str, str]:
+        out: dict[str, str] = {}
+        used = 0
+        for rel in files:
+            if Path(rel).suffix.lower() not in TEXT_SUFFIXES:
+                continue
+            try:
+                path = safe_join(self.project_dir, rel)
+                if path.stat().st_size > MAX_CONTEXT_FILE_BYTES:
+                    continue
+                text = path.read_text(encoding="utf-8")
+            except (OSError, ValueError):
+                continue
+            if used + len(text) > budget:
+                break
+            out[rel] = text
+            used += len(text)
+        return out
+
+    def _context_for(self, rel: str, depends_on: list[str]) -> dict[str, str]:
+        files = list_project_files(self.project_dir)
+        ordered = [d for d in depends_on if d in files] + [f for f in files if f not in depends_on]
+        ordered = [f for f in ordered if f != rel][:30]
+        return self._read_files(ordered, 60000)
+
+    # ----- un fișier: Qwen scrie -> salvare -> validare -> Gemini verifică -- #
+    def _produce_file(self, step: dict) -> bool:
+        rel = step["path"]
+        target = safe_join(self.project_dir, rel)
+        architect = self.session.architect
+        assert architect is not None
+        previous = target.read_text(encoding="utf-8", errors="replace") if target.is_file() else None
+        last_code = previous
+        feedback: Optional[str] = None
+
+        for attempt in range(1, MAX_ATTEMPTS + 1):
+            self._check()
+            if attempt == 1:
+                self.agent_log.emit(f"📝 Sarcină pentru Qwen → {rel}\n{step['requirements']}", "task")
+            else:
+                self.agent_log.emit(f"🔁 Refacere {rel} (încercarea {attempt}/{MAX_ATTEMPTS}) cu corecțiile lui Gemini.", "task")
+
+            title = f"{rel} — încercarea {attempt}/{MAX_ATTEMPTS}"
+            self.code_set.emit(title, "")
+            code = self.qwen.write_file(
+                rel, step["description"], step["requirements"], self.project_type,
+                project_files=list_project_files(self.project_dir),
+                context=self._context_for(rel, step.get("depends_on", [])),
+                previous_code=last_code, feedback=feedback,
+                on_token=self._on_token, cancel=self.cancel,
+            )
+            self._flush()
+            self.code_set.emit(title, code)
+            if self.qwen.last_truncated:
+                self.console.emit("⚠ Răspunsul lui Qwen a atins limita QWEN_NUM_PREDICT și poate fi incomplet.")
+
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(code, encoding="utf-8")
+            self.console.emit(f"💾 Salvat: {rel} ({len(code.splitlines())} linii)")
+
+            result = validate_file(self.project_type, self.project_dir, rel,
+                                   self.session.entry_file, self.console.emit, self.cancel)
+            self.console.emit(f"{'✔' if result.ok else '✘'} {result.summary}")
+
+            self._check()
+            self.agent_log.emit(f"🔍 Gemini face review la {rel}…", "info")
+            verdict, notes = architect.review(
+                rel, step["description"], step["requirements"], code, result.as_log(4000),
+                self.project_type, attempt, self.cancel)
+            if verdict == "OK" and not result.ok:
+                verdict = "REFA"
+                notes = f"Verificarea automată a eșuat, deci fișierul nu poate fi acceptat.\n{result.as_log(3000)}"
+            self.agent_log.emit(f"Verdict {rel}: {verdict}" + (f"\n{notes}" if notes else ""),
+                                "ok" if verdict == "OK" else "warn")
+            if verdict == "OK":
+                return True
+            feedback = notes or result.as_log(3000)
+            last_code = code
+
+        self.agent_log.emit(f"⚠ {rel}: limita de {MAX_ATTEMPTS} încercări a fost atinsă; păstrez ultima versiune.", "err")
+        return False
+
+    def _run_steps(self, steps: list[dict]) -> list[str]:
+        failed: list[str] = []
+        for index, step in enumerate(steps, 1):
+            self._check()
+            self.agent_log.emit(f"━━ Pasul {index}/{len(steps)}: {step['path']} ━━", "plan")
+            if not self._produce_file(step):
+                failed.append(step["path"])
+        return failed
+
+    def _maybe_push(self, commit_message: str) -> str:
+        if not (self.auto_push and self.project_type == "Python"):
+            return ""
+        self._check()
+        self.console.emit("🚀 Upload pe GitHub…")
+        result = push_project(self.project_dir, self.settings, self.console.emit, self.cancel, commit_message)
+        self.console.emit(f"{'✔' if result.ok else '✘'} {result.summary}")
+        return f" GitHub: {result.summary}"
+
+    # ----- moduri ---------------------------------------------------------- #
+    def _build(self) -> tuple[bool, str]:
+        architect = self.session.architect
+        assert architect is not None
+        files = list_project_files(self.project_dir)
+        self.agent_log.emit("📐 Gemini planifică proiectul…", "info")
+        plan = architect.plan(self.text, self.project_type, files,
+                              self._read_files(files, 60000), self.cancel)
+        self.session.entry_file = plan["entry_file"]
+        self.chat_message.emit("Gemini", plan["message"])
+
+        lines = [f"Plan: {plan['message']}", f"Fișier de intrare: {plan['entry_file'] or '—'}"]
+        lines += [f"{i}. {s['path']} — {s['description']}" for i, s in enumerate(plan["files"], 1)]
+        self.agent_log.emit("\n".join(lines), "plan")
+
+        failed = self._run_steps(plan["files"])
+        self.session.built = True
+        total = len(plan["files"])
+        summary = f"Proiect generat: {total - len(failed)}/{total} fișiere acceptate."
+        if failed:
+            summary += " Neacceptate: " + ", ".join(failed) + "."
+        summary += self._maybe_push("AutoDev Studio: proiect generat")
+        return not failed, summary
+
+    def _feedback(self) -> tuple[bool, str]:
+        architect = self.session.architect
+        assert architect is not None
+        files = list_project_files(self.project_dir)
+        self.agent_log.emit("💬 Gemini analizează feedback-ul…", "info")
+        result = architect.chat(self.text, self.project_type, files,
+                                self._read_files(files, 60000), self.cancel)
+        self.chat_message.emit("Gemini", result["reply"])
+        if result["entry_file"]:
+            self.session.entry_file = result["entry_file"]
+        tasks = result["tasks"]
+        if not tasks:
+            self.agent_log.emit("Gemini nu cere modificări de cod.", "info")
+            return True, "Fără modificări de cod."
+        self.agent_log.emit("Modificări planificate:\n" + "\n".join(f"• {t['path']} — {t['description']}" for t in tasks), "plan")
+        failed = self._run_steps(tasks)
+        summary = f"Modificări aplicate: {len(tasks) - len(failed)}/{len(tasks)} fișiere acceptate."
+        if failed:
+            summary += " Neacceptate: " + ", ".join(failed) + "."
+        summary += self._maybe_push("AutoDev Studio: modificări după feedback")
+        return not failed, summary
+
+
+# --------------------------------------------------------------------------- #
+# Dialog Setări
+# --------------------------------------------------------------------------- #
+class SettingsDialog(QDialog):
+    def __init__(self, settings: Settings, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.settings = settings
+        self.setWindowTitle("Setări")
+        self.setMinimumWidth(460)
+
+        self.gemini_edit = QLineEdit(settings.gemini_api_key)
+        self.token_edit = QLineEdit(settings.github_token)
+        self.user_edit = QLineEdit(settings.github_username)
+        self.private_check = QCheckBox("Repo privat pe GitHub")
+        self.private_check.setChecked(settings.github_private)
+        self.show_check = QCheckBox("Arată cheile")
+        for edit in (self.gemini_edit, self.token_edit):
+            edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.show_check.toggled.connect(self._toggle_echo)
+
+        form = QFormLayout()
+        form.addRow("Gemini API key:", self.gemini_edit)
+        form.addRow("GitHub token:", self.token_edit)
+        form.addRow("GitHub username:", self.user_edit)
+        form.addRow("", self.private_check)
+        form.addRow("", self.show_check)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+
+        layout = QVBoxLayout(self)
+        layout.addLayout(form)
+        layout.addWidget(QLabel("Se salvează în fișierul .env (permisiuni 600)."))
+        layout.addWidget(buttons)
+
+    def _toggle_echo(self, visible: bool) -> None:
+        mode = QLineEdit.EchoMode.Normal if visible else QLineEdit.EchoMode.Password
+        self.gemini_edit.setEchoMode(mode)
+        self.token_edit.setEchoMode(mode)
+
+    def accept(self) -> None:
+        self.settings.gemini_api_key = self.gemini_edit.text().strip()
+        self.settings.github_token = self.token_edit.text().strip()
+        self.settings.github_username = self.user_edit.text().strip()
+        self.settings.github_private = self.private_check.isChecked()
+        try:
+            self.settings.save()
+        except OSError as exc:
+            QMessageBox.critical(self, "Eroare", f"Nu am putut salva .env: {exc}")
+            return
+        super().accept()
+
+
+# --------------------------------------------------------------------------- #
+# Fereastra principală
+# --------------------------------------------------------------------------- #
+class MainWindow(QMainWindow):
+    def __init__(self) -> None:
+        super().__init__()
+        self.setWindowTitle("AutoDev Studio")
+        self.resize(1600, 900)
+        self.settings = Settings.load()
+        self.qsettings = QSettings("AutoDevStudio", "AutoDevStudio")
+        self.session = Session()
+        self.worker: Optional[PipelineWorker] = None
+        self.cancel = threading.Event()
+        self._build_ui()
+        self._restore()
+
+    # ----- UI -------------------------------------------------------------- #
+    def _panel(self, title: str, body: QWidget) -> QWidget:
+        box = QWidget()
+        layout = QVBoxLayout(box)
+        layout.setContentsMargins(6, 6, 6, 6)
+        label = QLabel(title)
+        label.setObjectName("panelTitle")
+        layout.addWidget(label)
+        layout.addWidget(body, 1)
+        return box
+
+    def _log_widget(self, mono: bool = False) -> QTextEdit:
+        widget = QTextEdit()
+        widget.setReadOnly(True)
+        widget.document().setMaximumBlockCount(6000)
+        if mono:
+            widget.setObjectName("mono")
+        return widget
+
+    def _build_ui(self) -> None:
+        central = QWidget()
+        root = QVBoxLayout(central)
+        root.setContentsMargins(8, 8, 8, 8)
+
+        # Bara de sus
+        top = QHBoxLayout()
+        self.type_combo = QComboBox()
+        self.type_combo.addItems(PROJECT_TYPES)
+        self.dir_edit = QLineEdit()
+        self.dir_edit.setReadOnly(True)
+        self.dir_edit.setPlaceholderText("Alege folderul proiectului…")
+        self.dir_button = QPushButton("Alege folder…")
+        self.push_check = QCheckBox("Auto GitHub Push (Python)")
+        self.settings_button = QPushButton("Setări")
+        self.stop_button = QPushButton("Stop")
+        self.stop_button.setObjectName("stopBtn")
+        self.stop_button.setEnabled(False)
+        top.addWidget(QLabel("Tip proiect:"))
+        top.addWidget(self.type_combo)
+        top.addSpacing(12)
+        top.addWidget(QLabel("Folder:"))
+        top.addWidget(self.dir_edit, 1)
+        top.addWidget(self.dir_button)
+        top.addSpacing(12)
+        top.addWidget(self.push_check)
+        top.addWidget(self.settings_button)
+        top.addWidget(self.stop_button)
+        root.addLayout(top)
+
+        # Panoul 1: Tu <-> Gemini
+        self.chat = self._log_widget()
+        self.input = QPlainTextEdit()
+        self.input.setPlaceholderText("Scrie cerințele sau feedback-ul… (Ctrl+Enter trimite)")
+        self.input.setFixedHeight(110)
+        self.send_button = QPushButton("Trimite către Gemini")
+        left = QWidget()
+        left_layout = QVBoxLayout(left)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.addWidget(self.chat, 1)
+        left_layout.addWidget(self.input)
+        left_layout.addWidget(self.send_button)
+
+        # Panoul 2: Gemini <-> Qwen
+        self.agent_view = self._log_widget()
+
+        # Panoul 3: cod (sus) + consolă (jos)
+        self.code_title = QLabel("Cod generat de Qwen")
+        self.code_view = QPlainTextEdit()
+        self.code_view.setObjectName("mono")
+        self.code_view.setReadOnly(True)
+        self.code_view.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        code_box = QWidget()
+        code_layout = QVBoxLayout(code_box)
+        code_layout.setContentsMargins(0, 0, 0, 0)
+        code_layout.addWidget(self.code_title)
+        code_layout.addWidget(self.code_view, 1)
+        self.console_view = self._log_widget(mono=True)
+        right = QSplitter(Qt.Orientation.Vertical)
+        right.addWidget(code_box)
+        right.addWidget(self._panel("Consolă (salvare, validare, GitHub)", self.console_view))
+        right.setSizes([520, 340])
+
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.addWidget(self._panel("1 · Tu ↔ Gemini", left))
+        splitter.addWidget(self._panel("2 · Gemini ↔ Qwen", self.agent_view))
+        splitter.addWidget(self._panel("3 · Rezultat", right))
+        splitter.setSizes([420, 480, 700])
+        root.addWidget(splitter, 1)
+        self.setCentralWidget(central)
+
+        # Conexiuni
+        self.dir_button.clicked.connect(self._choose_dir)
+        self.settings_button.clicked.connect(self._open_settings)
+        self.stop_button.clicked.connect(self._stop)
+        self.send_button.clicked.connect(self._send)
+        self.type_combo.currentTextChanged.connect(self._on_type_changed)
+        for key in ("Ctrl+Return", "Ctrl+Enter"):
+            QShortcut(QKeySequence(key), self.input).activated.connect(self._send)
+
+    def _restore(self) -> None:
+        self.type_combo.setCurrentText(self.settings.last_type)
+        if self.settings.last_dir and Path(self.settings.last_dir).is_dir():
+            self.dir_edit.setText(self.settings.last_dir)
+        self.push_check.setChecked(self.qsettings.value("auto_push", False, type=bool))
+        self.push_check.toggled.connect(lambda v: self.qsettings.setValue("auto_push", v))
+        self._on_type_changed(self.type_combo.currentText())
+        self._chat_add("Sistem", "Alege tipul și folderul proiectului, apoi descrie ce vrei să construim.")
+
+    # ----- afișare --------------------------------------------------------- #
+    @staticmethod
+    def _append(widget: QTextEdit, text: str, color: str) -> None:
+        safe = html.escape(text)
+        widget.append(f'<span style="color:{color}; white-space:pre-wrap">{safe}</span>')
+
+    def _chat_add(self, author: str, text: str) -> None:
+        key = {"Tu": "user", "Gemini": "gemini"}.get(author, "sys")
+        self.chat.append(f'<span style="color:{COLORS[key]}"><b>{html.escape(author)}</b></span>')
+        self._append(self.chat, text, "#dfe1e5")
+        self.chat.append("")
+
+    def _on_agent_log(self, text: str, kind: str) -> None:
+        self._append(self.agent_view, text, COLORS.get(kind, COLORS["info"]))
+        self.agent_view.append("")
+
+    def _on_console(self, text: str) -> None:
+        for line in text.splitlines() or [""]:
+            if line.startswith("$ "):
+                color = "#56b6c2"
+            elif line.startswith(("✔", "[OK]")):
+                color = COLORS["ok"]
+            elif line.startswith(("✘", "[EȘEC]", "Traceback")) or "Error" in line[:40]:
+                color = COLORS["err"]
+            elif line.startswith(("⚠", "⛔")):
+                color = COLORS["warn"]
+            elif line.startswith(("▶", "🚀", "💾")):
+                color = COLORS["user"]
+            else:
+                color = "#c9ccd1"
+            self._append(self.console_view, line, color)
+
+    def _on_code_set(self, title: str, text: str) -> None:
+        self.code_title.setText(f"Cod generat de Qwen — {title}")
+        self.code_view.setPlainText(text)
+        self.code_view.moveCursor(QTextCursor.MoveOperation.End)
+
+    def _on_code_chunk(self, chunk: str) -> None:
+        self.code_view.moveCursor(QTextCursor.MoveOperation.End)
+        self.code_view.insertPlainText(chunk)
+        self.code_view.ensureCursorVisible()
+
+    # ----- acțiuni --------------------------------------------------------- #
+    def _choose_dir(self) -> None:
+        start = self.dir_edit.text() or str(Path.home())
+        chosen = QFileDialog.getExistingDirectory(self, "Alege folderul proiectului", start)
+        if chosen:
+            self.dir_edit.setText(chosen)
+            self._persist_choice()
+
+    def _on_type_changed(self, project_type: str) -> None:
+        self.push_check.setEnabled(project_type == "Python")
+        self._persist_choice()
+
+    def _persist_choice(self) -> None:
+        self.settings.last_dir = self.dir_edit.text().strip()
+        self.settings.last_type = self.type_combo.currentText()
+        try:
+            self.settings.save()
+        except OSError:
+            pass
+
+    def _open_settings(self) -> None:
+        SettingsDialog(self.settings, self).exec()
+
+    def _stop(self) -> None:
+        self.cancel.set()
+        self.stop_button.setEnabled(False)
+        self._on_console("⛔ Stop cerut… aștept oprirea proceselor.")
+
+    def _set_running(self, running: bool) -> None:
+        self.send_button.setEnabled(not running)
+        self.type_combo.setEnabled(not running)
+        self.dir_button.setEnabled(not running)
+        self.settings_button.setEnabled(not running)
+        self.stop_button.setEnabled(running)
+
+    def _ensure_session(self, project_dir: str, project_type: str) -> bool:
+        key = self.settings.gemini_api_key
+        s = self.session
+        if (s.architect is not None and s.project_dir == project_dir
+                and s.project_type == project_type and s.api_key == key):
+            return True
+        try:
+            architect = GeminiArchitect(key)
+        except AgentError as exc:
+            QMessageBox.warning(self, "Gemini", str(exc))
+            return False
+        self.session = Session(architect=architect, api_key=key,
+                               project_dir=project_dir, project_type=project_type)
+        return True
+
+    def _send(self) -> None:
+        text = self.input.toPlainText().strip()
+        if not text or (self.worker is not None and self.worker.isRunning()):
+            return
+        if not self.settings.gemini_api_key:
+            QMessageBox.information(self, "Setări", "Adaugă mai întâi cheia Gemini API.")
+            self._open_settings()
+            if not self.settings.gemini_api_key:
+                return
+        project_dir = self.dir_edit.text().strip()
+        if not project_dir or not Path(project_dir).is_dir():
+            QMessageBox.warning(self, "Folder", "Alege un folder de proiect valid.")
+            return
+        project_type = self.type_combo.currentText()
+        if not self._ensure_session(project_dir, project_type):
+            return
+
+        mode = "feedback" if self.session.built else "build"
+        self.input.clear()
+        self._chat_add("Tu", text)
+        self.cancel = threading.Event()
+        worker = PipelineWorker(self.settings, self.session, mode, text,
+                                self.push_check.isChecked() and project_type == "Python", self.cancel)
+        worker.chat_message.connect(self._chat_add)
+        worker.agent_log.connect(self._on_agent_log)
+        worker.code_set.connect(self._on_code_set)
+        worker.code_chunk.connect(self._on_code_chunk)
+        worker.console.connect(self._on_console)
+        worker.finished_run.connect(self._on_finished)
+        self.worker = worker
+        self._set_running(True)
+        self._on_agent_log(f"━━ {'Proiect nou' if mode == 'build' else 'Feedback'} ━━", "plan")
+        worker.start()
+
+    def _on_finished(self, ok: bool, summary: str) -> None:
+        self._set_running(False)
+        self._chat_add("Sistem", ("✅ " if ok else "⚠ ") + summary)
+
+    def closeEvent(self, event) -> None:  # noqa: N802 - convenția Qt
+        if self.worker is not None and self.worker.isRunning():
+            self.cancel.set()
+            self.worker.wait(4000)
+        super().closeEvent(event)
+
+
+# --------------------------------------------------------------------------- #
+# Temă dark
+# --------------------------------------------------------------------------- #
+STYLESHEET = """
+QWidget { background-color: #1e1f22; color: #dfe1e5; font-size: 10.5pt; }
+QLabel#panelTitle { color: #8ab4f8; font-weight: bold; padding: 2px 0; }
+QTextEdit, QPlainTextEdit, QLineEdit, QComboBox {
+    background-color: #2b2d30; border: 1px solid #3c3f41; border-radius: 6px; padding: 4px;
+    selection-background-color: #2f65ca;
+}
+QTextEdit#mono, QPlainTextEdit#mono {
+    font-family: "JetBrains Mono", "Fira Code", "DejaVu Sans Mono", monospace; font-size: 10pt;
+}
+QPushButton { background-color: #3574f0; border: none; border-radius: 6px; padding: 6px 14px; color: white; }
+QPushButton:hover { background-color: #4a88ff; }
+QPushButton:disabled { background-color: #3c3f41; color: #7a7e85; }
+QPushButton#stopBtn { background-color: #c0392b; }
+QPushButton#stopBtn:hover { background-color: #e04a3a; }
+QPushButton#stopBtn:disabled { background-color: #3c3f41; color: #7a7e85; }
+QComboBox QAbstractItemView { background-color: #2b2d30; selection-background-color: #2f65ca; }
+QCheckBox::indicator { width: 16px; height: 16px; }
+QSplitter::handle { background-color: #3c3f41; }
+QToolTip { background-color: #2b2d30; color: #dfe1e5; border: 1px solid #3c3f41; }
+"""
+
+
+def apply_dark_theme(app: QApplication) -> None:
+    app.setStyle("Fusion")
+    palette = QPalette()
+    roles = {
+        QPalette.ColorRole.Window: "#1e1f22", QPalette.ColorRole.WindowText: "#dfe1e5",
+        QPalette.ColorRole.Base: "#2b2d30", QPalette.ColorRole.AlternateBase: "#25272a",
+        QPalette.ColorRole.Text: "#dfe1e5", QPalette.ColorRole.Button: "#2b2d30",
+        QPalette.ColorRole.ButtonText: "#dfe1e5", QPalette.ColorRole.ToolTipBase: "#2b2d30",
+        QPalette.ColorRole.ToolTipText: "#dfe1e5", QPalette.ColorRole.Highlight: "#2f65ca",
+        QPalette.ColorRole.HighlightedText: "#ffffff", QPalette.ColorRole.PlaceholderText: "#7a7e85",
+    }
+    for role, color in roles.items():
+        palette.setColor(role, QColor(color))
+    app.setPalette(palette)
+    app.setStyleSheet(STYLESHEET)
+
+
+def main() -> None:
+    app = QApplication(sys.argv)
+    apply_dark_theme(app)
+    window = MainWindow()
+    window.show()
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()
