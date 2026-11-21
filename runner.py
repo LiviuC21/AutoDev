@@ -318,3 +318,38 @@ def run_gradle_build(project_dir: Path, log=None) -> tuple[bool, str]:
     )
     out = (proc.stdout + "\n" + proc.stderr).strip()
     return proc.returncode == 0, out[-2500:]
+
+def deploy_and_capture_android(project_dir: Path, package_name: str, log=None) -> tuple[bool, Optional[Path], str]:
+    """Instalează APK-ul debug pe telefon prin adb, pornește aplicația și face o captură de ecran."""
+    apk = project_dir / "app" / "build" / "outputs" / "apk" / "debug" / "app-debug.apk"
+    if not apk.exists():
+        return False, None, f"Nu găsesc APK-ul compilat la {apk}"
+
+    # Verifică dacă există telefon conectat
+    devs = subprocess.run(["adb", "devices"], capture_output=True, text=True)
+    if "\tdevice" not in devs.stdout:
+        return False, None, "Niciun telefon conectat prin adb."
+
+    if log:
+        log(f"📲 Instalez {apk.name} pe telefon…")
+    inst = subprocess.run(["adb", "install", "-r", str(apk)], capture_output=True, text=True, timeout=60)
+    if inst.returncode != 0:
+        return False, None, f"Eroare adb install: {inst.stderr or inst.stdout}"
+
+    if log:
+        log(f"▶ Lansez {package_name} pe telefon…")
+    subprocess.run(
+        ["adb", "shell", "monkey", "-p", package_name, "-c", "android.intent.category.LAUNCHER", "1"],
+        capture_output=True, text=True, timeout=15,
+    )
+    time.sleep(4)  # Așteptăm să se încarce UI-ul pe ecran
+
+    shot = project_dir / "_last_screenshot.png"
+    with open(shot, "wb") as f:
+        cap = subprocess.run(["adb", "exec-out", "screencap", "-p"], stdout=f, stderr=subprocess.PIPE, timeout=15)
+    if cap.returncode != 0 or shot.stat().st_size == 0:
+        return False, None, "Nu am putut face captura de ecran prin adb."
+
+    if log:
+        log(f"📸 Captură salvată: {shot.name}")
+    return True, shot, "OK"
