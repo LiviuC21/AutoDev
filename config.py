@@ -16,6 +16,7 @@ GEMINI_MODELS = [
     "gemini-3.5-flash",
     "gemini-3.5-flash-lite",
 ]
+GEMINI_MODEL = GEMINI_MODELS[0]
 OLLAMA_URL = "http://localhost:11434"
 QWEN_MODEL = "qwen2.5-coder:14b"
 QWEN_NUM_CTX = 8192
