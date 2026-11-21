@@ -6,7 +6,8 @@ import sys
 import threading
 import time
 import traceback
-from runner import open_android_studio, prepare_android_project, run_gradle_build, validate_file
+import re
+from runner import deploy_and_capture_android, open_android_studio, prepare_android_project, run_gradle_build, validate_file,
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -236,6 +237,21 @@ class PipelineWorker(QThread):
         self.agent_log.emit("\n".join(lines), "plan")
 
         failed = self._run_steps(plan["files"])
+        if "android" in self.project_type.lower():
+            proj_path = Path(self.project_dir)
+            pkg = f"com.autodev.{re.sub(r'[^A-Za-z0-9]', '', proj_path.name).lower() or 'autodevapp'}"
+            ok_build, build_out = run_gradle_build(proj_path, log=self.console.emit)
+            self.console.emit("✔ Gradle build reușit!" if ok_build else f"✘ Gradle build eșuat:\n{build_out}")
+            if ok_build:
+                ok_adb, shot, msg = deploy_and_capture_android(proj_path, pkg, log=self.console.emit)
+                if ok_adb and shot:
+                    self.agent_log.emit("👁 Gemini Vision analizează captura de pe telefon…", "info")
+                    verdict, notes = architect.review_screenshot(shot, self.text, self.cancel)
+                    self.agent_log.emit(f"Verdict UI telefon: {verdict}\n{notes}",
+                                        "ok" if verdict == "OK" else "warn")
+                    self.chat_message.emit("Gemini (Vision)", f"Verdict UI: {verdict}\n{notes}")
+                else:
+                    self.console.emit(f"⚠ ADB: {msg}")
         self.session.built = True
         total = len(plan["files"])
         summary = f"Proiect generat: {total - len(failed)}/{total} fișiere acceptate."
