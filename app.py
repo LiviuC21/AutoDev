@@ -23,7 +23,6 @@ from PyQt6.QtWidgets import (
 from agents import AgentError, GeminiArchitect, QwenWorker
 from config import MAX_ATTEMPTS, PROJECT_TYPES, Cancelled, Settings, list_project_files, safe_join
 from github_manager import push_project
-from runner import validate_file
 
 TEXT_SUFFIXES = {
     ".py", ".kt", ".java", ".xml", ".json", ".txt", ".gradle", ".kts", ".md",
