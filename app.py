@@ -7,7 +7,7 @@ import threading
 import time
 import traceback
 import re
-from runner import deploy_and_capture_android, open_android_studio, prepare_android_project, run_gradle_build, validate_file,
+from runner import deploy_and_capture_android, open_android_studio, prepare_android_project, run_gradle_build, validate_file
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
