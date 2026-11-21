@@ -9,13 +9,19 @@ from pathlib import Path
 APP_DIR = Path(__file__).resolve().parent
 ENV_PATH = APP_DIR / ".env"
 
-GEMINI_MODEL = "gemini-3.6-flash"
+GEMINI_MODELS = [
+    "gemini-3.8-flash",
+    "gemini-3.7-flash",
+    "gemini-3.6-flash",
+    "gemini-3.5-flash",
+    "gemini-3.5-flash-lite",
+]
 OLLAMA_URL = "http://localhost:11434"
-QWEN_MODEL = "qwen2.5-coder:7b"
+QWEN_MODEL = "qwen2.5-coder:14b"
 QWEN_NUM_CTX = 8192
 QWEN_NUM_PREDICT = 4096            # tokeni maximi generați de Qwen per fișier
 QWEN_PROMPT_CHAR_BUDGET = 12000    # ~3500 tokeni de prompt, restul rămâne pentru răspuns
-MAX_ATTEMPTS = 3                   # încercări per fișier
+MAX_ATTEMPTS = 5                   # încercări per fișier
 RUN_TIMEOUT = 10                   # secunde de rulare pentru testul unui fișier Python
 
 PROJECT_TYPES = ("Python", "Android")
@@ -142,3 +148,6 @@ def list_project_files(project_dir: str | Path, limit: int = 300) -> list[str]:
 def slugify_repo(name: str) -> str:
     slug = re.sub(r"[^A-Za-z0-9._-]+", "-", name).strip("-.")
     return slug or "autodev-project"
+
+ANDROID_TEMPLATE_DIR = Path.home() / "Proiecte" / "_AndroidTemplate"
+ANDROID_STUDIO_CMD = "android-studio"

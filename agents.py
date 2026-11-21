@@ -133,11 +133,14 @@ cu un context foarte mic. De aceea:
 - pentru fiecare fișier scrii cerințe foarte concrete: nume exacte de clase/funcții/metode, semnături,
   importuri dintre fișiere, formate de date, comportament, tratarea erorilor;
 - ordonezi fișierele astfel încât fiecare să importe doar fișiere scrise înaintea lui.
-Răspunzi mereu în limba română (cu excepția codului și a numelor tehnice).
+Răspunzi în limba română în câmpurile `message` și `reply` (pentru utilizator), dar scrii ÎNTOTDEAUNA în limba ENGLEZĂ câmpurile `description`, `requirements` și notele de review `REFA` (pentru Qwen).O
 Proiecte Python: țintă Linux, Python 3.11+, rulează într-un .venv. Doar fișierul de intrare are blocul
 `if __name__ == "__main__":`; celelalte module trebuie să poată fi importate fără efecte secundare
 (fără input(), fără rețea, fără ferestre la import). Dacă folosești biblioteci externe, primul fișier din plan
-este `requirements.txt`. Proiecte Android: Kotlin + Gradle, structură standard (app/src/main/...)."""
+este `requirements.txt`. Proiecte Android: Kotlin + Gradle, structură standard (app/src/main/...).Reguli stricte de UI/UX (Design 2026):
+- Pentru aplicații desktop Python cu GUI, NU folosi Tkinter standard. Folosește PyQt6 (cu Fusion + stylesheet QSS modern) sau CustomTkinter (dark mode), adăugând librăria în requirements.txt.
+- Design modern: temă dark curată (#18181b / #27272a), culori de accent moderne (ex. #3b82f6 sau #8b5cf6), colțuri rotunjite (border-radius 8px-10px), spațiere generoasă (padding/margins), etichete clare și placeholder-e pe fiecare câmp de input, butoane cu efect hover și layout aerisit.
+- Pentru aplicații Android: folosește Material Design 3 (MaterialComponents / Jetpack Compose sau XML modern cu carduri rotunjite, temă dark/dinamică și spațiere corectă). """
 
 PLAN_SCHEMA = """{
   "message": "scurt răspuns pentru utilizator (2-4 propoziții): ce vei construi",
@@ -376,6 +379,40 @@ def extract_code(text: str) -> str:
             code = text
     return code.strip("\n") + "\n"
 
+QWEN_EDIT_SYSTEM = """You are an expert software engineer modifying an EXISTING file.
+DO NOT rewrite the whole file. Output ONLY one or more SEARCH/REPLACE blocks for the exact lines that must change:
+
+<<<<<<< SEARCH
+exact existing lines from the current file
+=======
+new replacement lines
+>>>>>>> REPLACE
+
+Rules:
+- Copy the SEARCH lines EXACTLY as they appear in the current file (same indentation and spacing).
+- Keep SEARCH blocks short (3-10 lines of context) so they match uniquely.
+- Never output the whole file unless every single line changes. No explanations outside the blocks."""
+
+_PATCH_RE = re.compile(
+    r"<<<<<<< SEARCH\s*\n(.*?)\n=======\s*\n(.*?)\n>>>>>>> REPLACE",
+    re.S,
+)
+
+
+def apply_patches(original: str, raw: str) -> str:
+    """Aplică blocurile SEARCH/REPLACE pe fișierul existent. Fallback la cod complet dacă nu există blocuri."""
+    patches = _PATCH_RE.findall(raw.replace("\r\n", "\n"))
+    if not patches:
+        # Plasă de siguranță: dacă Qwen a rescris tot fișierul în loc de patch, îl folosim normal.
+        return extract_code(raw)
+
+    updated = original.replace("\r\n", "\n")
+    for search_block, replace_block in patches:
+        if search_block in updated:
+            updated = updated.replace(search_block, replace_block, 1)
+        elif search_block.strip() and search_block.strip() in updated:
+            updated = updated.replace(search_block.strip(), replace_block.strip(), 1)
+    return updated.strip("\n") + "\n"
 
 class QwenWorker:
     """Scrie cod prin Ollama, cu streaming live și suport pentru Stop."""
@@ -404,14 +441,21 @@ class QwenWorker:
                      previous_code: Optional[str] = None,
                      feedback: Optional[str] = None) -> tuple[str, str]:
         """Construiește (system, prompt) încadrat în QWEN_PROMPT_CHAR_BUDGET."""
+        is_edit = bool(previous_code and previous_code.strip())
+        system_prompt = QWEN_EDIT_SYSTEM if is_edit else QWEN_SYSTEM
+
         requirements = _clip(requirements, QWEN_PROMPT_CHAR_BUDGET // 3)
         head = f"Project type: {project_type}\nFile to write: {rel}\nRole: {description}\n\nRequirements:\n{requirements}\n"
         if project_files:
             names = "\n".join(f"- {f}" for f in project_files[:60])
             head += f"\nProject files:\n{names}\n"
-        footer = f"\nReturn ONLY the complete content of {rel} in a single fenced code block."
+        footer = (
+            f"\nReturn ONLY SEARCH/REPLACE blocks to update {rel}."
+            if is_edit
+            else f"\nReturn ONLY the complete content of {rel} in a single fenced code block."
+        )
 
-        budget = QWEN_PROMPT_CHAR_BUDGET - len(QWEN_SYSTEM) - len(head) - len(footer) - 200
+        budget = QWEN_PROMPT_CHAR_BUDGET - len(system_prompt) - len(head) - len(footer) - 200
         feedback_text = ""
         if feedback:
             feedback_text = "\nReview notes to apply (mandatory):\n" + _clip(feedback, max(500, min(3000, budget // 4))) + "\n"
@@ -428,7 +472,7 @@ class QwenWorker:
             chunk = f"\nOther project file {path}:\n```\n{_clip(code, part_limit)}\n```\n"
             context_text += chunk
             budget -= len(chunk)
-        return QWEN_SYSTEM, head + context_text + previous_text + feedback_text + footer
+        return system_prompt, head + context_text + previous_text + feedback_text + footer
 
     # ----- generare -------------------------------------------------------- #
     def generate(self, system: str, prompt: str, on_token: Optional[Callable[[str], None]] = None,
@@ -522,7 +566,10 @@ class QwenWorker:
         system, prompt = self.build_prompt(
             rel, description, requirements, project_type, project_files, context, previous_code, feedback)
         raw = self.generate(system, prompt, on_token, cancel)
-        code = extract_code(raw)
+        if previous_code and previous_code.strip():
+            code = apply_patches(previous_code, raw)
+        else:
+            code = extract_code(raw)
         if not code.strip():
             raise AgentError("Qwen a returnat un răspuns gol.")
         return code

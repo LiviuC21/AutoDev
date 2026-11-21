@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Callable, Optional, Sequence
 
 from config import RUN_TIMEOUT, Cancelled, safe_join
+from config import ANDROID_TEMPLATE_DIR, ANDROID_STUDIO_CMD
 
 Emit = Callable[[str], None]
 
@@ -237,3 +238,83 @@ def validate_file(project_type: str, project_dir: str | Path, rel: str, entry_fi
         return install_requirements(project_dir, emit, cancel)
     emit(f"✔ Salvat: {rel} (fără verificare automată pentru acest tip de fișier)")
     return RunResult(True, "Fișier salvat (fără verificare automată pentru acest tip).")
+
+def prepare_android_project(project_dir: Path, app_name: str, log=None) -> str:
+    """Copiază matrița Android dacă folderul e gol, redenumește pachetul și returnează package_name."""
+    clean_name = re.sub(r"[^A-Za-z0-9]", "", app_name) or "AutoDevApp"
+    pkg_suffix = clean_name.lower()
+    new_pkg = f"com.autodev.{pkg_suffix}"
+
+    # Dacă proiectul există deja, nu îl suprascriem
+    if (project_dir / "settings.gradle.kts").exists():
+        if log:
+            log("📱 Proiect Android existent detectat — păstrez structura actuală.")
+        return new_pkg
+
+    if not ANDROID_TEMPLATE_DIR.exists():
+        raise FileNotFoundError(f"Nu găsesc matrița la {ANDROID_TEMPLATE_DIR}")
+
+    if log:
+        log(f"📱 Creez proiectul Android '{clean_name}' ({new_pkg}) din matriță…")
+
+    ignore = shutil.ignore_patterns(".gradle", "build", ".idea", ".git", "local.properties")
+    shutil.copytree(ANDROID_TEMPLATE_DIR, project_dir, dirs_exist_ok=True, ignore=ignore)
+
+    # Înlocuiește AppTemplate și com.autodev.apptemplate în fișierele text
+    exts = {".kts", ".kt", ".xml", ".pro", ".gradle"}
+    for f in project_dir.rglob("*"):
+        if f.is_file() and f.suffix in exts:
+            try:
+                txt = f.read_text(encoding="utf-8")
+                new_txt = txt.replace("com.autodev.apptemplate", new_pkg).replace("AppTemplate", clean_name)
+                if new_txt != txt:
+                    f.write_text(new_txt, encoding="utf-8")
+            except Exception:
+                pass
+
+    # Redenumește folderele de pachet (main, test, androidTest)
+    for src_set in ("main", "test", "androidTest"):
+        old_dir = project_dir / "app" / "src" / src_set / "java" / "com" / "autodev" / "apptemplate"
+        new_dir = project_dir / "app" / "src" / src_set / "java" / "com" / "autodev" / pkg_suffix
+        if old_dir.exists() and old_dir != new_dir:
+            old_dir.rename(new_dir)
+
+    gradlew = project_dir / "gradlew"
+    if gradlew.exists():
+        gradlew.chmod(0o755)
+
+    return new_pkg
+
+
+def open_android_studio(project_dir: Path, log=None) -> None:
+    """Deschide Android Studio direct pe folderul proiectului (fără să blocheze AutoDev)."""
+    try:
+        subprocess.Popen(
+            [ANDROID_STUDIO_CMD, str(project_dir)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        if log:
+            log(f"🚀 Android Studio deschis pe: {project_dir}")
+    except FileNotFoundError:
+        if log:
+            log("⚠ Comanda 'android-studio' nu a fost găsită în PATH.")
+
+
+def run_gradle_build(project_dir: Path, log=None) -> tuple[bool, str]:
+    """Compilează proiectul Android cu ./gradlew assembleDebug și returnează (ok, output)."""
+    gradlew = project_dir / "gradlew"
+    if not gradlew.exists():
+        return True, "Lipsește gradlew; sar peste build."
+    if log:
+        log("🔨 Compilez proiectul Android (./gradlew assembleDebug)…")
+    proc = subprocess.run(
+        [str(gradlew), "assembleDebug", "--no-daemon"],
+        cwd=str(project_dir),
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+    out = (proc.stdout + "\n" + proc.stderr).strip()
+    return proc.returncode == 0, out[-2500:]

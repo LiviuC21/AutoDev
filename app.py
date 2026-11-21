@@ -6,6 +6,7 @@ import sys
 import threading
 import time
 import traceback
+from runner import open_android_studio, prepare_android_project, run_gradle_build, validate_file
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -217,6 +218,12 @@ class PipelineWorker(QThread):
     def _build(self) -> tuple[bool, str]:
         architect = self.session.architect
         assert architect is not None
+
+        if "android" in self.project_type.lower():
+            proj_path = Path(self.project_dir)
+            prepare_android_project(proj_path, proj_path.name, log=self.console.emit)
+            open_android_studio(proj_path, log=self.console.emit)
+
         files = list_project_files(self.project_dir)
         self.agent_log.emit("📐 Gemini planifică proiectul…", "info")
         plan = architect.plan(self.text, self.project_type, files,
