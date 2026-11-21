@@ -5,6 +5,7 @@ import json
 import re
 import threading
 import time
+from pathlib import Path
 from typing import Any, Callable, Optional
 
 import requests
@@ -13,7 +14,7 @@ from google.genai import types
 
 from config import (
     GEMINI_MODEL, MAX_ATTEMPTS, OLLAMA_URL, QWEN_MODEL, QWEN_NUM_CTX,
-    QWEN_NUM_PREDICT, QWEN_PROMPT_CHAR_BUDGET, Cancelled,
+    QWEN_NUM_PREDICT, QWEN_PROMPT_CHAR_BUDGET, Cancelled,GEMINI_MODELS
 )
 
 MAX_HISTORY_PAIRS = 8  # perechi (utilizator, Gemini) păstrate în conversație
@@ -196,29 +197,26 @@ class GeminiArchitect:
             kwargs["response_mime_type"] = "application/json"
         config = types.GenerateContentConfig(**kwargs)
         last_error: Optional[BaseException] = None
-        for attempt in range(1, 4):
+        models_to_try = [self.model] + [m for m in GEMINI_MODELS if m != self.model]
+        for model_name in models_to_try:
             _check_cancel(cancel)
             try:
                 response = run_cancellable(
-                    lambda: self.client.models.generate_content(
-                        model=self.model, contents=contents, config=config),
+                    lambda m=model_name: self.client.models.generate_content(
+                        model=m, contents=contents, config=config),
                     cancel,
                 )
+                self.model = model_name
                 return (response.text or "").strip()
             except Cancelled:
                 raise
             except Exception as exc:  # noqa: BLE001
                 last_error = exc
-                transient = any(marker in str(exc).lower() for marker in TRANSIENT_MARKERS)
-                if attempt < 3 and transient:
-                    delay = 3.0 * attempt
-                    if cancel is not None:
-                        cancel.wait(delay)
-                    else:
-                        time.sleep(delay)
+                msg = str(exc)
+                if any(k in msg for k in ("429", "503", "RESOURCE_EXHAUSTED", "UNAVAILABLE")):
                     continue
-                break
-        raise AgentError(f"Eroare Gemini: {last_error}") from last_error
+                raise AgentError(f"Eroare Gemini ({model_name}): {exc}") from exc
+        raise AgentError(f"Toate modelele Gemini au atins limita: {last_error}")
 
     def _json_call(self, prompt: str, use_history: bool, cancel: Optional[threading.Event]) -> dict[str, Any]:
         current = prompt
@@ -341,6 +339,60 @@ Răspunde DOAR cu JSON valid, exact în această schemă:
         self._remember(message, reply)
         return {"reply": reply, "entry_file": entry, "tasks": tasks}
 
+# ----- review vizual (Vision) ------------------------------------------ #
+    def review_screenshot(self, image_path: Path, app_goal: str,
+                          cancel: Optional[threading.Event] = None) -> tuple[str, str]:
+        """Analizează captura de ecran de pe telefon și returnează (verdict, observații)."""
+        img_bytes = image_path.read_bytes()
+        prompt = (
+            f"You are a senior Android UI/UX reviewer. Goal of the app: {app_goal}\n"
+            "Inspect this screenshot taken on a real Android phone. Check for:\n"
+            "1. Crashes, blank screens, or system error dialogs.\n"
+            "2. Overlapping text, clipped buttons, or broken layout.\n"
+            "3. Clean modern dark/Material 3 appearance.\n"
+            "Reply on line 1 with ONLY 'OK' or 'REFA', followed by short concrete notes in Romanian."
+        )
+        contents = [
+            types.Content(
+                role="user",
+                parts=[
+                    types.Part.from_bytes(data=img_bytes, mime_type="image/png"),
+                    types.Part.from_text(text=prompt),
+                ],
+            )
+        ]
+        config = types.GenerateContentConfig(
+            system_instruction="You are a strict Android UI/UX reviewer.",
+            temperature=0.2,
+        )
+        last_error: Optional[BaseException] = None
+        models_to_try = [self.model] + [m for m in GEMINI_MODELS if m != self.model]
+        raw = ""
+        for model_name in models_to_try:
+            _check_cancel(cancel)
+            try:
+                response = run_cancellable(
+                    lambda m=model_name: self.client.models.generate_content(
+                        model=m, contents=contents, config=config),
+                    cancel,
+                )
+                self.model = model_name
+                raw = (response.text or "").strip()
+                break
+            except Cancelled:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                last_error = exc
+                if any(k in str(exc) for k in ("429", "503", "RESOURCE_EXHAUSTED", "UNAVAILABLE")):
+                    continue
+                raise AgentError(f"Eroare Gemini Vision ({model_name}): {exc}") from exc
+        else:
+            raise AgentError(f"Toate modelele Gemini au atins limita: {last_error}")
+
+        lines = raw.splitlines() or ["REFA"]
+        first, rest = lines[0], lines[1:]
+        verdict = "OK" if "OK" in first.upper() and "REFA" not in first.upper() else "REFA"
+        return verdict, "\n".join(rest).strip()
 
 # --------------------------------------------------------------------------- #
 # Qwen — Muncitorul (Ollama, streaming)
