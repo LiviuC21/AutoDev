@@ -12,16 +12,19 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-from PyQt6.QtCore import QSettings, Qt, QThread, pyqtSignal
+from PyQt6.QtCore import QSettings, Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import QColor, QKeySequence, QPalette, QShortcut, QTextCursor
 from PyQt6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout,
-    QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMessageBox, QPlainTextEdit, QPushButton,
+    QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMessageBox, QPlainTextEdit, QPushButton, QSpinBox,
     QSplitter, QTextEdit, QVBoxLayout, QWidget,
 )
 
-from agents import AgentError, GeminiArchitect, QwenWorker
-from config import MAX_ATTEMPTS, PROJECT_TYPES, Cancelled, Settings, list_project_files, safe_join
+from agents import AgentError, GeminiArchitect, QwenWorker, list_ollama_models
+from config import (
+    GEMINI_MODELS, MAX_ATTEMPTS, PROJECT_TYPES, Cancelled, Settings,
+    list_project_files, safe_join,
+)
 from github_manager import push_project
 
 TEXT_SUFFIXES = {
@@ -35,6 +38,25 @@ COLORS = {
     "warn": "#f0a35e", "err": "#f07178", "user": "#61afef", "gemini": "#7fd18b", "sys": "#9aa7b8",
 }
 
+def read_cpu_temp() -> Optional[float]:
+    """Citește temperatura CPU (°C) din /sys/class/hwmon (k10temp / coretemp / acpitz)."""
+    hwmon = Path("/sys/class/hwmon")
+    if not hwmon.is_dir():
+        return None
+    priority = ("k10temp", "coretemp", "zenpower", "acpitz")
+    found: dict[str, float] = {}
+    for entry in hwmon.iterdir():
+        try:
+            name = (entry / "name").read_text(encoding="utf-8").strip()
+            if name in priority:
+                raw = (entry / "temp1_input").read_text(encoding="utf-8").strip()
+                found[name] = int(raw) / 1000.0
+        except (OSError, ValueError):
+            continue
+    for key in priority:
+        if key in found:
+            return found[key]
+    return None
 
 # --------------------------------------------------------------------------- #
 # Sesiune (rămâne între mesajele din panoul 1)
@@ -43,11 +65,11 @@ COLORS = {
 class Session:
     architect: Optional[GeminiArchitect] = None
     api_key: str = ""
+    gemini_model: str = ""
     project_dir: str = ""
     project_type: str = ""
     entry_file: str = ""
     built: bool = False
-
 
 # --------------------------------------------------------------------------- #
 # Worker — toată logica rulează aici, comunică doar prin semnale
@@ -71,7 +93,10 @@ class PipelineWorker(QThread):
         self.cancel = cancel
         self.project_dir = session.project_dir
         self.project_type = session.project_type
-        self.qwen = QwenWorker()
+        self.qwen = QwenWorker(
+            model=settings.ollama_model,
+            num_thread=settings.ollama_threads,
+        )
         self._buffer: list[str] = []
         self._last_flush = 0.0
 
@@ -400,6 +425,38 @@ class MainWindow(QMainWindow):
         top.addWidget(self.settings_button)
         top.addWidget(self.stop_button)
         root.addLayout(top)
+        # Bara 2: Modele AI, thread-uri și temperatură CPU
+        bar2 = QHBoxLayout()
+        self.ollama_combo = QComboBox()
+        self.ollama_combo.setMinimumWidth(220)
+        self.refresh_ollama_btn = QPushButton("↻")
+        self.refresh_ollama_btn.setToolTip("Reîncarcă lista de modele din Ollama")
+        self.refresh_ollama_btn.setFixedWidth(34)
+
+        self.gemini_combo = QComboBox()
+        self.gemini_combo.addItems(GEMINI_MODELS)
+        self.gemini_combo.setMinimumWidth(180)
+
+        self.threads_spin = QSpinBox()
+        self.threads_spin.setRange(0, 32)
+        self.threads_spin.setSpecialValueText("Auto")
+        self.threads_spin.setToolTip("Thread-uri CPU folosite de Ollama (0 = Auto, 4-6 = mai rece)")
+
+        self.temp_label = QLabel("🌡️ --°C")
+        self.temp_label.setToolTip("Temperatura CPU în timp real (k10temp)")
+
+        bar2.addWidget(QLabel("Model local (Ollama):"))
+        bar2.addWidget(self.ollama_combo)
+        bar2.addWidget(self.refresh_ollama_btn)
+        bar2.addSpacing(14)
+        bar2.addWidget(QLabel("Model Gemini:"))
+        bar2.addWidget(self.gemini_combo)
+        bar2.addSpacing(14)
+        bar2.addWidget(QLabel("Thread-uri:"))
+        bar2.addWidget(self.threads_spin)
+        bar2.addStretch(1)
+        bar2.addWidget(self.temp_label)
+        root.addLayout(bar2)
 
         # Panoul 1: Tu <-> Gemini
         self.chat = self._log_widget()
@@ -450,8 +507,20 @@ class MainWindow(QMainWindow):
         self.type_combo.currentTextChanged.connect(self._on_type_changed)
         for key in ("Ctrl+Return", "Ctrl+Enter"):
             QShortcut(QKeySequence(key), self.input).activated.connect(self._send)
+        self.refresh_ollama_btn.clicked.connect(self._refresh_ollama_models)
+        self.ollama_combo.currentTextChanged.connect(self._persist_choice)
+        self.gemini_combo.currentTextChanged.connect(self._persist_choice)
+        self.threads_spin.valueChanged.connect(self._persist_choice)
+
+        self.temp_timer = QTimer(self)
+        self.temp_timer.timeout.connect(self._update_temp)
+        self.temp_timer.start(3000)
+        self._update_temp()
 
     def _restore(self) -> None:
+        self._refresh_ollama_models()
+        self.gemini_combo.setCurrentText(self.settings.gemini_model)
+        self.threads_spin.setValue(self.settings.ollama_threads)
         self.type_combo.setCurrentText(self.settings.last_type)
         if self.settings.last_dir and Path(self.settings.last_dir).is_dir():
             self.dir_edit.setText(self.settings.last_dir)
@@ -514,9 +583,40 @@ class MainWindow(QMainWindow):
         self.push_check.setEnabled(project_type == "Python")
         self._persist_choice()
 
+    def _refresh_ollama_models(self) -> None:
+        current = self.ollama_combo.currentText() or self.settings.ollama_model
+        models = list_ollama_models()
+        if not models:
+            models = [current]
+        elif current and current not in models:
+            models.insert(0, current)
+        self.ollama_combo.blockSignals(True)
+        self.ollama_combo.clear()
+        self.ollama_combo.addItems(models)
+        self.ollama_combo.setCurrentText(current)
+        self.ollama_combo.blockSignals(False)
+
+    def _update_temp(self) -> None:
+        temp = read_cpu_temp()
+        if temp is None:
+            self.temp_label.setText("🌡️ N/A")
+            return
+        if temp >= 85:
+            color = COLORS["err"]
+        elif temp >= 75:
+            color = COLORS["warn"]
+        else:
+            color = COLORS["ok"]
+        self.temp_label.setText(f'<span style="color:{color}; font-weight:bold;">🌡️ {temp:.1f}°C</span>')
+
     def _persist_choice(self) -> None:
         self.settings.last_dir = self.dir_edit.text().strip()
         self.settings.last_type = self.type_combo.currentText()
+        if self.ollama_combo.currentText():
+            self.settings.ollama_model = self.ollama_combo.currentText()
+        if self.gemini_combo.currentText():
+            self.settings.gemini_model = self.gemini_combo.currentText()
+        self.settings.ollama_threads = self.threads_spin.value()
         try:
             self.settings.save()
         except OSError:
@@ -535,20 +635,26 @@ class MainWindow(QMainWindow):
         self.type_combo.setEnabled(not running)
         self.dir_button.setEnabled(not running)
         self.settings_button.setEnabled(not running)
+        self.ollama_combo.setEnabled(not running)
+        self.refresh_ollama_btn.setEnabled(not running)
+        self.gemini_combo.setEnabled(not running)
+        self.threads_spin.setEnabled(not running)
         self.stop_button.setEnabled(running)
 
     def _ensure_session(self, project_dir: str, project_type: str) -> bool:
         key = self.settings.gemini_api_key
+        gmodel = self.settings.gemini_model
         s = self.session
         if (s.architect is not None and s.project_dir == project_dir
-                and s.project_type == project_type and s.api_key == key):
+                and s.project_type == project_type and s.api_key == key
+                and s.gemini_model == gmodel):
             return True
         try:
-            architect = GeminiArchitect(key)
+            architect = GeminiArchitect(key, model=gmodel)
         except AgentError as exc:
             QMessageBox.warning(self, "Gemini", str(exc))
             return False
-        self.session = Session(architect=architect, api_key=key,
+        self.session = Session(architect=architect, api_key=key, gemini_model=gmodel,
                                project_dir=project_dir, project_type=project_type)
         return True
 
