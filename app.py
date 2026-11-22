@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import html
+import json
 import sys
 import threading
 import time
@@ -32,6 +33,28 @@ TEXT_SUFFIXES = {
     ".properties", ".toml", ".cfg", ".ini", ".yml", ".yaml", ".pro",
 }
 MAX_CONTEXT_FILE_BYTES = 20000
+
+STATE_FILENAME = ".autodev_state.json"
+
+
+def load_state(project_dir: str) -> Optional[dict]:
+    if not project_dir:
+        return None
+    path = Path(project_dir) / STATE_FILENAME
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def save_state(project_dir: str, state: dict) -> None:
+    path = Path(project_dir) / STATE_FILENAME
+    tmp = Path(project_dir) / f"{STATE_FILENAME}.tmp"
+    tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(path)
 
 COLORS = {
     "info": "#9aa7b8", "plan": "#c792ea", "task": "#e5c07b", "ok": "#7fd18b",
@@ -147,6 +170,8 @@ class PipelineWorker(QThread):
                 raise AgentError(problem)
             if self.mode == "build":
                 ok, summary = self._build()
+            elif self.mode == "resume":
+                ok, summary = self._resume()
             else:
                 ok, summary = self._feedback()
             self.finished_run.emit(ok, summary)
@@ -181,6 +206,9 @@ class PipelineWorker(QThread):
     def _read_files(self, files: list[str], budget: int) -> dict[str, str]:
         out: dict[str, str] = {}
         used = 0
+        for rel in files:
+            if Path(rel).name == STATE_FILENAME or Path(rel).suffix.lower() not in TEXT_SUFFIXES:
+                continue
         for rel in files:
             if Path(rel).suffix.lower() not in TEXT_SUFFIXES:
                 continue
@@ -275,12 +303,34 @@ class PipelineWorker(QThread):
         self.agent_log.emit(f"⚠ {rel}: limita de {MAX_ATTEMPTS} încercări a fost atinsă; păstrez ultima versiune.", "err")
         return False
 
-    def _run_steps(self, steps: list[dict]) -> list[str]:
+    def _save_progress(self, steps: list[dict], completed: list[str], done: bool = False) -> None:
+        try:
+            save_state(self.project_dir, {
+                "goal": self.text,
+                "project_type": self.project_type,
+                "entry_file": self.session.entry_file,
+                "steps": steps,
+                "completed": completed,
+                "done": done,
+            })
+        except OSError as exc:
+            self.console.emit(f"⚠ Nu am putut salva checkpoint-ul: {exc}")
+
+    def _run_steps(self, steps: list[dict], completed: Optional[list[str]] = None,
+                   save_checkpoint: bool = False) -> list[str]:
         failed: list[str] = []
+        done_list = list(completed or [])
         for index, step in enumerate(steps, 1):
             self._check()
+            if step["path"] in done_list:
+                self.agent_log.emit(f"⏭ Pasul {index}/{len(steps)}: {step['path']} (deja terminat)", "info")
+                continue
             self.agent_log.emit(f"━━ Pasul {index}/{len(steps)}: {step['path']} ━━", "plan")
-            if not self._produce_file(step):
+            if self._produce_file(step):
+                done_list.append(step["path"])
+                if save_checkpoint:
+                    self._save_progress(steps, done_list, done=False)
+            else:
                 failed.append(step["path"])
         return failed
 
@@ -314,7 +364,8 @@ class PipelineWorker(QThread):
         lines += [f"{i}. {s['path']} — {s['description']}" for i, s in enumerate(plan["files"], 1)]
         self.agent_log.emit("\n".join(lines), "plan")
 
-        failed = self._run_steps(plan["files"])
+        self._save_progress(plan["files"], [], done=False)
+        failed = self._run_steps(plan["files"], completed=[], save_checkpoint=True)
         if "android" in self.project_type.lower():
             proj_path = Path(self.project_dir)
             pkg = f"com.autodev.{re.sub(r'[^A-Za-z0-9]', '', proj_path.name).lower() or 'autodevapp'}"
@@ -331,11 +382,58 @@ class PipelineWorker(QThread):
                 else:
                     self.console.emit(f"⚠ ADB: {msg}")
         self.session.built = True
+        done_paths = [s["path"] for s in plan["files"] if s["path"] not in failed]
+        self._save_progress(plan["files"], done_paths, done=(not failed))
         total = len(plan["files"])
         summary = f"Proiect generat: {total - len(failed)}/{total} fișiere acceptate."
         if failed:
             summary += " Neacceptate: " + ", ".join(failed) + "."
         summary += self._maybe_push("AutoDev Studio: proiect generat")
+        return not failed, summary
+
+    def _resume(self) -> tuple[bool, str]:
+        architect = self.session.architect
+        assert architect is not None
+        state = load_state(self.project_dir)
+        if not state or not state.get("steps"):
+            return False, "Nu există un checkpoint valid de reluat."
+
+        self.text = state.get("goal", "")
+        self.session.entry_file = state.get("entry_file", "")
+        steps = state["steps"]
+        completed = list(state.get("completed", []))
+        if self.text and not architect.history:
+            architect._remember(self.text, "Plan restaurat din checkpoint.")
+
+        self.agent_log.emit(
+            f"▶ Reluare din checkpoint: {len(completed)}/{len(steps)} fișiere deja terminate.", "plan"
+        )
+        failed = self._run_steps(steps, completed=completed, save_checkpoint=True)
+
+        if "android" in self.project_type.lower():
+            proj_path = Path(self.project_dir)
+            pkg = f"com.autodev.{re.sub(r'[^A-Za-z0-9]', '', proj_path.name).lower() or 'autodevapp'}"
+            ok_build, build_out = run_gradle_build(proj_path, log=self.console.emit)
+            self.console.emit("✔ Gradle build reușit!" if ok_build else f"✘ Gradle build eșuat:\n{build_out}")
+            if ok_build:
+                ok_adb, shot, msg = deploy_and_capture_android(proj_path, pkg, log=self.console.emit)
+                if ok_adb and shot:
+                    self.agent_log.emit("👁 Gemini Vision analizează captura de pe telefon…", "info")
+                    verdict, notes = architect.review_screenshot(shot, self.text, self.cancel)
+                    self.agent_log.emit(f"Verdict UI telefon: {verdict}\n{notes}",
+                                        "ok" if verdict == "OK" else "warn")
+                    self.chat_message.emit("Gemini (Vision)", f"Verdict UI: {verdict}\n{notes}")
+                else:
+                    self.console.emit(f"⚠ ADB: {msg}")
+
+        self.session.built = True
+        done_paths = [s["path"] for s in steps if s["path"] not in failed]
+        self._save_progress(steps, done_paths, done=(not failed))
+        total = len(steps)
+        summary = f"Proiect reluat și finalizat: {total - len(failed)}/{total} fișiere acceptate."
+        if failed:
+            summary += " Neacceptate: " + ", ".join(failed) + "."
+        summary += self._maybe_push("AutoDev Studio: proiect finalizat din checkpoint")
         return not failed, summary
 
     def _feedback(self) -> tuple[bool, str]:
@@ -465,6 +563,8 @@ class MainWindow(QMainWindow):
         self.dir_button = QPushButton("Alege folder…")
         self.push_check = QCheckBox("Auto GitHub Push (Python)")
         self.settings_button = QPushButton("Setări")
+        self.resume_button = QPushButton("▶ Continuă")
+        self.resume_button.setEnabled(False)
         self.stop_button = QPushButton("Stop")
         self.stop_button.setObjectName("stopBtn")
         self.stop_button.setEnabled(False)
@@ -477,6 +577,7 @@ class MainWindow(QMainWindow):
         top.addSpacing(12)
         top.addWidget(self.push_check)
         top.addWidget(self.settings_button)
+        top.addWidget(self.resume_button)
         top.addWidget(self.stop_button)
         root.addLayout(top)
         # Bara 2: Modele AI, thread-uri și temperatură CPU
@@ -556,6 +657,7 @@ class MainWindow(QMainWindow):
         # Conexiuni
         self.dir_button.clicked.connect(self._choose_dir)
         self.settings_button.clicked.connect(self._open_settings)
+        self.resume_button.clicked.connect(self._resume)
         self.stop_button.clicked.connect(self._stop)
         self.send_button.clicked.connect(self._send)
         self.type_combo.currentTextChanged.connect(self._on_type_changed)
@@ -582,6 +684,7 @@ class MainWindow(QMainWindow):
         self.push_check.toggled.connect(lambda v: self.qsettings.setValue("auto_push", v))
         self._on_type_changed(self.type_combo.currentText())
         self._chat_add("Sistem", "Alege tipul și folderul proiectului, apoi descrie ce vrei să construim.")
+        self._update_resume_button()
 
     # ----- afișare --------------------------------------------------------- #
     @staticmethod
@@ -632,6 +735,7 @@ class MainWindow(QMainWindow):
         if chosen:
             self.dir_edit.setText(chosen)
             self._persist_choice()
+            self._update_resume_button()
 
     def _on_type_changed(self, project_type: str) -> None:
         self.push_check.setEnabled(project_type == "Python")
@@ -694,6 +798,7 @@ class MainWindow(QMainWindow):
         self.gemini_combo.setEnabled(not running)
         self.threads_spin.setEnabled(not running)
         self.stop_button.setEnabled(running)
+        self._update_resume_button()
 
     def _ensure_session(self, project_dir: str, project_type: str) -> bool:
         key = self.settings.gemini_api_key
@@ -749,6 +854,51 @@ class MainWindow(QMainWindow):
     def _on_finished(self, ok: bool, summary: str) -> None:
         self._set_running(False)
         self._chat_add("Sistem", ("✅ " if ok else "⚠ ") + summary)
+        self._update_resume_button()
+
+    def _update_resume_button(self) -> None:
+        running = self.worker is not None and self.worker.isRunning()
+        state = load_state(self.dir_edit.text().strip())
+        if not running and state and not state.get("done") and state.get("steps"):
+            done_cnt = len(state.get("completed", []))
+            total_cnt = len(state["steps"])
+            self.resume_button.setText(f"▶ Continuă ({done_cnt}/{total_cnt})")
+            self.resume_button.setEnabled(True)
+        else:
+            self.resume_button.setText("▶ Continuă")
+            self.resume_button.setEnabled(False)
+
+    def _resume(self) -> None:
+        if self.worker is not None and self.worker.isRunning():
+            return
+        if not self.settings.gemini_api_key:
+            QMessageBox.information(self, "Setări", "Adaugă mai întâi cheia Gemini API.")
+            self._open_settings()
+            if not self.settings.gemini_api_key:
+                return
+        project_dir = self.dir_edit.text().strip()
+        state = load_state(project_dir)
+        if not state or not state.get("steps"):
+            self._update_resume_button()
+            return
+        project_type = state.get("project_type") or self.type_combo.currentText()
+        self.type_combo.setCurrentText(project_type)
+        if not self._ensure_session(project_dir, project_type):
+            return
+
+        self.cancel = threading.Event()
+        worker = PipelineWorker(self.settings, self.session, "resume", "",
+                                self.push_check.isChecked() and project_type == "Python", self.cancel)
+        worker.chat_message.connect(self._chat_add)
+        worker.agent_log.connect(self._on_agent_log)
+        worker.code_set.connect(self._on_code_set)
+        worker.code_chunk.connect(self._on_code_chunk)
+        worker.console.connect(self._on_console)
+        worker.finished_run.connect(self._on_finished)
+        self.worker = worker
+        self._set_running(True)
+        self._on_agent_log("━━ Reluare proiect din checkpoint ━━", "plan")
+        worker.start()
 
     def closeEvent(self, event) -> None:  # noqa: N802 - convenția Qt
         if self.worker is not None and self.worker.isRunning():
