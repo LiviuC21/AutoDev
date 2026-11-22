@@ -523,6 +523,7 @@ class MainWindow(QMainWindow):
         self.session = Session()
         self.worker: Optional[PipelineWorker] = None
         self.cancel = threading.Event()
+        self.attached_files: list[str] = []
         self._build_ui()
         self._restore()
 
@@ -615,12 +616,26 @@ class MainWindow(QMainWindow):
         self.input = QPlainTextEdit()
         self.input.setPlaceholderText("Scrie cerințele sau feedback-ul… (Ctrl+Enter trimite)")
         self.input.setFixedHeight(110)
+
+        attach_bar = QHBoxLayout()
+        self.attach_button = QPushButton("📎 Atașează fișiere…")
+        self.attach_label = QLabel("Niciun fișier atașat")
+        self.attach_label.setStyleSheet("color: #9aa7b8; font-size: 9.5pt;")
+        self.clear_attach_btn = QPushButton("✕")
+        self.clear_attach_btn.setToolTip("Șterge fișierele atașate")
+        self.clear_attach_btn.setFixedWidth(30)
+        self.clear_attach_btn.setEnabled(False)
+        attach_bar.addWidget(self.attach_button)
+        attach_bar.addWidget(self.attach_label, 1)
+        attach_bar.addWidget(self.clear_attach_btn)
+
         self.send_button = QPushButton("Trimite către Gemini")
         left = QWidget()
         left_layout = QVBoxLayout(left)
         left_layout.setContentsMargins(0, 0, 0, 0)
         left_layout.addWidget(self.chat, 1)
         left_layout.addWidget(self.input)
+        left_layout.addLayout(attach_bar)
         left_layout.addWidget(self.send_button)
 
         # Panoul 2: Gemini <-> Qwen
@@ -669,6 +684,8 @@ class MainWindow(QMainWindow):
         self.temp_timer.timeout.connect(self._update_temp)
         self.temp_timer.start(3000)
         self._update_temp()
+        self.attach_button.clicked.connect(self._attach_files)
+        self.clear_attach_btn.clicked.connect(self._clear_attachments)
 
     def _restore(self) -> None:
         self._refresh_ollama_models()
@@ -794,6 +811,8 @@ class MainWindow(QMainWindow):
         self.refresh_ollama_btn.setEnabled(not running)
         self.gemini_combo.setEnabled(not running)
         self.threads_spin.setEnabled(not running)
+        self.attach_button.setEnabled(not running)
+        self.clear_attach_btn.setEnabled((not running) and bool(self.attached_files))
         self.stop_button.setEnabled(running)
         if running:
             self.resume_button.setEnabled(False)
@@ -817,6 +836,52 @@ class MainWindow(QMainWindow):
                                project_dir=project_dir, project_type=project_type)
         return True
 
+    def _attach_files(self) -> None:
+        start = self.dir_edit.text() or str(Path.home())
+        paths, _ = QFileDialog.getOpenFileNames(
+            self,
+            "Alege fișiere de referință pentru Gemini",
+            start,
+            "Fișiere text/cod (*.py *.kt *.java *.xml *.json *.md *.txt *.gradle *.kts *.yml *.yaml *.ini *.cfg *.pro);;Toate fișierele (*)",
+        )
+        if not paths:
+            return
+        for p in paths:
+            if p not in self.attached_files:
+                self.attached_files.append(p)
+        self._update_attach_ui()
+
+    def _clear_attachments(self) -> None:
+        self.attached_files.clear()
+        self._update_attach_ui()
+
+    def _update_attach_ui(self) -> None:
+        if not self.attached_files:
+            self.attach_label.setText("Niciun fișier atașat")
+            self.clear_attach_btn.setEnabled(False)
+            return
+        names = [Path(p).name for p in self.attached_files]
+        preview = ", ".join(names[:3]) + (f" (+{len(names) - 3})" if len(names) > 3 else "")
+        self.attach_label.setText(f"{len(names)} atașate: {preview}")
+        self.clear_attach_btn.setEnabled(True)
+
+    def _format_attachments(self) -> str:
+        if not self.attached_files:
+            return ""
+        blocks: list[str] = []
+        for raw_path in self.attached_files:
+            p = Path(raw_path)
+            try:
+                content = p.read_text(encoding="utf-8", errors="replace")
+                if len(content) > 25000:
+                    content = content[:25000] + "\n… [tăiat la 25.000 caractere]"
+                blocks.append(f"### {p.name}\n```\n{content}\n```")
+            except OSError as exc:
+                self._on_console(f"⚠ Nu am putut citi fișierul atașat {p.name}: {exc}")
+        if not blocks:
+            return ""
+        return "\n\n--- Fișiere atașate de utilizator ca referință ---\n" + "\n\n".join(blocks)
+
     def _send(self) -> None:
         text = self.input.toPlainText().strip()
         if not text or (self.worker is not None and self.worker.isRunning()):
@@ -835,10 +900,17 @@ class MainWindow(QMainWindow):
             return
 
         mode = "feedback" if self.session.built else "build"
+        attached_names = [Path(p).name for p in self.attached_files]
+        attachments_block = self._format_attachments()
+        full_prompt = text + attachments_block
+
         self.input.clear()
-        self._chat_add("Tu", text)
+        self._clear_attachments()
+        display_msg = text + (f"\n\n📎 Atașate: {', '.join(attached_names)}" if attached_names else "")
+        self._chat_add("Tu", display_msg)
+
         self.cancel = threading.Event()
-        worker = PipelineWorker(self.settings, self.session, mode, text,
+        worker = PipelineWorker(self.settings, self.session, mode, full_prompt,
                                 self.push_check.isChecked() and project_type == "Python", self.cancel)
         worker.chat_message.connect(self._chat_add)
         worker.agent_log.connect(self._on_agent_log)
