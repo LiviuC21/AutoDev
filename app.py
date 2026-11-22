@@ -866,7 +866,7 @@ class MainWindow(QMainWindow):
         self.attach_label.setText(f"{len(names)} atașate: {preview}")
         self.clear_attach_btn.setEnabled(True)
 
-    def def _format_attachments(self) -> str:
+    def _format_attachments(self) -> str:
         if not self.attached_files:
             return ""
         blocks: list[str] = []
