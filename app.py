@@ -17,9 +17,9 @@ from typing import Optional
 from PyQt6.QtCore import QSettings, Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import QColor, QKeySequence, QPalette, QShortcut, QTextCursor
 from PyQt6.QtWidgets import (
-    QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout,
-    QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMessageBox, QPlainTextEdit, QPushButton, QSpinBox,
-    QSplitter, QTextEdit, QVBoxLayout, QWidget,
+    QApplication, QButtonGroup, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog,
+    QFormLayout, QFrame, QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMessageBox, QPlainTextEdit,
+    QPushButton, QRadioButton, QScrollArea, QSpinBox, QSplitter, QTextEdit, QVBoxLayout, QWidget,
 )
 
 from agents import AgentError, GeminiArchitect, QwenWorker, list_ollama_models
@@ -456,6 +456,113 @@ class PipelineWorker(QThread):
         summary += self._maybe_push("AutoDev Studio: modificări după feedback")
         return not failed, summary
 
+# --------------------------------------------------------------------------- #
+# Worker + Dialog Chestionar de clarificare
+# --------------------------------------------------------------------------- #
+class ClarifyWorker(QThread):
+    ready = pyqtSignal(dict)
+    failed = pyqtSignal(str)
+
+    def __init__(self, architect: GeminiArchitect, requirements: str, project_type: str,
+                 cancel: threading.Event) -> None:
+        super().__init__()
+        self.architect = architect
+        self.requirements = requirements
+        self.project_type = project_type
+        self.cancel = cancel
+
+    def run(self) -> None:
+        try:
+            data = self.architect.clarify(self.requirements, self.project_type, self.cancel)
+            self.ready.emit(data)
+        except Cancelled:
+            self.failed.emit("Chestionar anulat.")
+        except Exception as exc:  # noqa: BLE001
+            self.failed.emit(str(exc))
+
+
+class QuestionnaireDialog(QDialog):
+    def __init__(self, data: dict, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Chestionar de clarificare — Gemini")
+        self.resize(760, 680)
+        self._entries: list[tuple[str, bool, list, QLineEdit]] = []
+        self._groups: list[QButtonGroup] = []
+
+        root = QVBoxLayout(self)
+        intro = QLabel(data.get("intro", ""))
+        intro.setWordWrap(True)
+        intro.setStyleSheet("color: #8ab4f8; font-weight: bold; padding: 4px 0 8px 0;")
+        root.addWidget(intro)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        container = QWidget()
+        form_layout = QVBoxLayout(container)
+        form_layout.setSpacing(12)
+
+        for idx, q in enumerate(data.get("questions", []), 1):
+            card = QFrame()
+            card.setStyleSheet(
+                "QFrame { background-color: #25272a; border: 1px solid #3c3f41; border-radius: 8px; padding: 8px; }"
+            )
+            c_layout = QVBoxLayout(card)
+            c_layout.setSpacing(6)
+
+            q_label = QLabel(f"{idx}. {q['question']}")
+            q_label.setWordWrap(True)
+            q_label.setStyleSheet("font-weight: bold; color: #dfe1e5; border: none; padding: 0;")
+            c_layout.addWidget(q_label)
+
+            multiple = bool(q.get("multiple", False))
+            widgets: list = []
+            if multiple:
+                for opt in q["options"]:
+                    cb = QCheckBox(opt)
+                    cb.setStyleSheet("border: none;")
+                    c_layout.addWidget(cb)
+                    widgets.append(cb)
+            else:
+                group = QButtonGroup(self)
+                self._groups.append(group)
+                for opt in q["options"]:
+                    rb = QRadioButton(opt)
+                    rb.setStyleSheet("border: none;")
+                    group.addButton(rb)
+                    c_layout.addWidget(rb)
+                    widgets.append(rb)
+
+            custom = QLineEdit()
+            custom.setPlaceholderText("Altă variantă sau detalii suplimentare (opțional)…")
+            c_layout.addWidget(custom)
+
+            self._entries.append((q["question"], multiple, widgets, custom))
+            form_layout.addWidget(card)
+
+        form_layout.addStretch(1)
+        scroll.setWidget(container)
+        root.addWidget(scroll, 1)
+
+        buttons = QDialogButtonBox()
+        ok_btn = buttons.addButton("Generează planul", QDialogButtonBox.ButtonRole.AcceptRole)
+        cancel_btn = buttons.addButton("Anulează", QDialogButtonBox.ButtonRole.RejectRole)
+        ok_btn.clicked.connect(self.accept)
+        cancel_btn.clicked.connect(self.reject)
+        root.addWidget(buttons)
+
+    def format_answers(self) -> str:
+        lines: list[str] = []
+        for idx, (question, _multiple, widgets, custom) in enumerate(self._entries, 1):
+            chosen = [w.text() for w in widgets if w.isChecked()]
+            extra = custom.text().strip()
+            if extra:
+                chosen.append(f"Altă variantă: {extra}")
+            if chosen:
+                lines.append(f"{idx}. {question}\n   Răspuns: {'; '.join(chosen)}")
+        if not lines:
+            return ""
+        return "\n\n--- Răspunsuri la chestionarul de clarificare ---\n" + "\n".join(lines)
 
 # --------------------------------------------------------------------------- #
 # Dialog Setări
@@ -527,6 +634,8 @@ class MainWindow(QMainWindow):
         self.attached_files: list[str] = []
         self._build_ui()
         self._restore()
+        self.clarify_worker: Optional[ClarifyWorker] = None
+        self._pending_build: Optional[tuple[str, str, str, str]] = None
 
     # ----- UI -------------------------------------------------------------- #
     def _panel(self, title: str, body: QWidget) -> QWidget:
@@ -630,6 +739,10 @@ class MainWindow(QMainWindow):
         attach_bar.addWidget(self.attach_label, 1)
         attach_bar.addWidget(self.clear_attach_btn)
 
+        self.clarify_check = QCheckBox("📋 Chestionar de clarificare (înainte de plan)")
+        self.clarify_check.setToolTip("Gemini îți pune 8-15 întrebări cu variante înainte să facă planul")
+        self.send_button = QPushButton("Trimite către Gemini")
+
         self.send_button = QPushButton("Trimite către Gemini")
         left = QWidget()
         left_layout = QVBoxLayout(left)
@@ -637,6 +750,8 @@ class MainWindow(QMainWindow):
         left_layout.addWidget(self.chat, 1)
         left_layout.addWidget(self.input)
         left_layout.addLayout(attach_bar)
+        left_layout.addWidget(self.clarify_check)
+        left_layout.addWidget(self.send_button)
         left_layout.addWidget(self.send_button)
 
         # Panoul 2: Gemini <-> Qwen
@@ -814,6 +929,7 @@ class MainWindow(QMainWindow):
         self.threads_spin.setEnabled(not running)
         self.attach_button.setEnabled(not running)
         self.clear_attach_btn.setEnabled((not running) and bool(self.attached_files))
+        self.clarify_check.setEnabled(not running)
         self.stop_button.setEnabled(running)
         if running:
             self.resume_button.setEnabled(False)
@@ -912,7 +1028,11 @@ class MainWindow(QMainWindow):
 
     def _send(self) -> None:
         text = self.input.toPlainText().strip()
-        if not text or (self.worker is not None and self.worker.isRunning()):
+        if not text:
+            return
+        if (self.worker is not None and self.worker.isRunning()) or (
+            self.clarify_worker is not None and self.clarify_worker.isRunning()
+        ):
             return
         if not self.settings.gemini_api_key:
             QMessageBox.information(self, "Setări", "Adaugă mai întâi cheia Gemini API.")
@@ -931,12 +1051,56 @@ class MainWindow(QMainWindow):
         attached_names = [Path(p).name for p in self.attached_files]
         attachments_block = self._format_attachments()
         full_prompt = text + attachments_block
+        display_msg = text + (f"\n\n📎 Atașate: {', '.join(attached_names)}" if attached_names else "")
+
+        if mode == "build" and self.clarify_check.isChecked():
+            assert self.session.architect is not None
+            self._pending_build = (text, full_prompt, display_msg, project_type)
+            self.input.clear()
+            self._clear_attachments()
+            self._chat_add("Tu", display_msg)
+            self._on_agent_log("📋 Gemini pregătește chestionarul de clarificare…", "info")
+            self.cancel = threading.Event()
+            cw = ClarifyWorker(self.session.architect, full_prompt, project_type, self.cancel)
+            cw.ready.connect(self._on_clarify_ready)
+            cw.failed.connect(self._on_clarify_failed)
+            self.clarify_worker = cw
+            self._set_running(True)
+            cw.start()
+            return
 
         self.input.clear()
         self._clear_attachments()
-        display_msg = text + (f"\n\n📎 Atașate: {', '.join(attached_names)}" if attached_names else "")
         self._chat_add("Tu", display_msg)
+        self._start_pipeline(mode, full_prompt, project_type)
 
+    def _on_clarify_ready(self, data: dict) -> None:
+        self._set_running(False)
+        pending = self._pending_build
+        self._pending_build = None
+        if not pending:
+            return
+        raw_text, full_prompt, _display_msg, project_type = pending
+        dialog = QuestionnaireDialog(data, self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            answers = dialog.format_answers()
+            if answers:
+                self._chat_add("Tu (Chestionar)", answers.replace("\n\n--- Răspunsuri la chestionarul de clarificare ---\n", ""))
+            self._start_pipeline("build", full_prompt + answers, project_type)
+        else:
+            self._chat_add("Sistem", "Chestionar anulat. Îți poți edita cerința și trimite din nou.")
+            self.input.setPlainText(raw_text)
+
+    def _on_clarify_failed(self, msg: str) -> None:
+        self._set_running(False)
+        pending = self._pending_build
+        self._pending_build = None
+        self._on_agent_log(f"✘ Chestionar: {msg}", "err")
+        self._chat_add("Sistem", f"⚠ {msg}")
+        if pending:
+            self.input.setPlainText(pending[0])
+
+    def _start_pipeline(self, mode: str, full_prompt: str, project_type: str) -> None:
         self.cancel = threading.Event()
         worker = PipelineWorker(self.settings, self.session, mode, full_prompt,
                                 self.push_check.isChecked() and project_type == "Python", self.cancel)
