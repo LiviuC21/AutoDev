@@ -58,6 +58,45 @@ def read_cpu_temp() -> Optional[float]:
             return found[key]
     return None
 
+_SIG_PY_RE = re.compile(r"^\s*(?:async\s+)?(?:def|class)\s+[^\n:]+", re.M)
+_SIG_KT_RE = re.compile(r"^\s*(?:(?:public|private|internal|protected|data|sealed|open|abstract|override|suspend)\s+)*(?:class|interface|object|enum\s+class|fun)\s+[^\n{=]+", re.M)
+_SIG_XML_ID_RE = re.compile(r'android:id="@\+id/([^"]+)"')
+
+
+def build_project_map(project_dir: str, exclude: set[str], budget: int = 2500) -> str:
+    """Extrage o hartă compactă de semnături (clase, funcții, ID-uri XML) din restul fișierelor."""
+    lines: list[str] = []
+    used = 0
+    for rel in list_project_files(project_dir):
+        if rel in exclude:
+            continue
+        suffix = Path(rel).suffix.lower()
+        if suffix not in {".py", ".kt", ".java", ".xml"}:
+            continue
+        try:
+            path = safe_join(project_dir, rel)
+            if path.stat().st_size > MAX_CONTEXT_FILE_BYTES:
+                continue
+            text = path.read_text(encoding="utf-8", errors="ignore")
+        except (OSError, ValueError):
+            continue
+
+        if suffix == ".py":
+            sigs = [m.strip() for m in _SIG_PY_RE.findall(text)]
+        elif suffix in {".kt", ".java"}:
+            sigs = [m.strip() for m in _SIG_KT_RE.findall(text)]
+        else:
+            ids = _SIG_XML_ID_RE.findall(text)
+            sigs = [f"ids: {', '.join(ids)}"] if ids else []
+
+        if not sigs:
+            continue
+        entry = f"- {rel}: " + " | ".join(sigs[:12])
+        if used + len(entry) > budget:
+            break
+        lines.append(entry)
+        used += len(entry) + 1
+    return "\n".join(lines)
 # --------------------------------------------------------------------------- #
 # Sesiune (rămâne între mesajele din panoul 1)
 # --------------------------------------------------------------------------- #
@@ -159,10 +198,21 @@ class PipelineWorker(QThread):
         return out
 
     def _context_for(self, rel: str, depends_on: list[str]) -> dict[str, str]:
-        files = list_project_files(self.project_dir)
-        ordered = [d for d in depends_on if d in files] + [f for f in files if f not in depends_on]
-        ordered = [f for f in ordered if f != rel][:30]
-        return self._read_files(ordered, 60000)
+        files = set(list_project_files(self.project_dir))
+        strict_deps = [d for d in depends_on if d in files and d != rel]
+        return self._read_files(strict_deps, 20000)
+
+    def _read_requested_file(self, rel: str) -> Optional[str]:
+        try:
+            path = safe_join(self.project_dir, rel)
+            if not path.is_file() or path.stat().st_size > MAX_CONTEXT_FILE_BYTES:
+                self.console.emit(f"⚠ Modelul a cerut {rel}, dar nu poate fi citit.")
+                return None
+            self.agent_log.emit(f"📂 Modelul local a cerut fișierul: {rel}", "info")
+            self.console.emit(f"📂 NEED_FILE satisfăcut: {rel}")
+            return path.read_text(encoding="utf-8", errors="replace")
+        except (OSError, ValueError):
+            return None
 
     # ----- un fișier: Qwen scrie -> salvare -> validare -> Gemini verifică -- #
     def _produce_file(self, step: dict) -> bool:
@@ -183,10 +233,14 @@ class PipelineWorker(QThread):
 
             title = f"{rel} — încercarea {attempt}/{MAX_ATTEMPTS}"
             self.code_set.emit(title, "")
+            deps = step.get("depends_on", [])
+            pmap = build_project_map(self.project_dir, exclude={rel, *deps})
             code = self.qwen.write_file(
                 rel, step["description"], step["requirements"], self.project_type,
                 project_files=list_project_files(self.project_dir),
-                context=self._context_for(rel, step.get("depends_on", [])),
+                context=self._context_for(rel, deps),
+                project_map=pmap,
+                on_need_file=self._read_requested_file,
                 previous_code=last_code, feedback=feedback,
                 on_token=self._on_token, cancel=self.cancel,
             )
