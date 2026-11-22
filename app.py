@@ -211,7 +211,17 @@ class PipelineWorker(QThread):
                 continue
             try:
                 path = safe_join(self.project_dir, rel)
-
+                if path.stat().st_size > MAX_CONTEXT_FILE_BYTES:
+                    continue
+                text = path.read_text(encoding="utf-8")
+            except (OSError, ValueError):
+                continue
+            if used + len(text) > budget:
+                break
+            out[rel] = text
+            used += len(text)
+        return out
+        
     def _context_for(self, rel: str, depends_on: list[str]) -> dict[str, str]:
         files = set(list_project_files(self.project_dir))
         strict_deps = [d for d in depends_on if d in files and d != rel]
