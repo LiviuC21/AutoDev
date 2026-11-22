@@ -209,21 +209,8 @@ class PipelineWorker(QThread):
         for rel in files:
             if Path(rel).name == STATE_FILENAME or Path(rel).suffix.lower() not in TEXT_SUFFIXES:
                 continue
-        for rel in files:
-            if Path(rel).suffix.lower() not in TEXT_SUFFIXES:
-                continue
             try:
                 path = safe_join(self.project_dir, rel)
-                if path.stat().st_size > MAX_CONTEXT_FILE_BYTES:
-                    continue
-                text = path.read_text(encoding="utf-8")
-            except (OSError, ValueError):
-                continue
-            if used + len(text) > budget:
-                break
-            out[rel] = text
-            used += len(text)
-        return out
 
     def _context_for(self, rel: str, depends_on: list[str]) -> dict[str, str]:
         files = set(list_project_files(self.project_dir))
@@ -798,7 +785,10 @@ class MainWindow(QMainWindow):
         self.gemini_combo.setEnabled(not running)
         self.threads_spin.setEnabled(not running)
         self.stop_button.setEnabled(running)
-        self._update_resume_button()
+        if running:
+            self.resume_button.setEnabled(False)
+        else:
+            self._update_resume_button()
 
     def _ensure_session(self, project_dir: str, project_type: str) -> bool:
         key = self.settings.gemini_api_key
