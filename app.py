@@ -4,6 +4,7 @@ from __future__ import annotations
 import html
 import json
 import sys
+import zipfile
 import threading
 import time
 import traceback
@@ -842,7 +843,7 @@ class MainWindow(QMainWindow):
             self,
             "Alege fișiere de referință pentru Gemini",
             start,
-            "Fișiere text/cod (*.py *.kt *.java *.xml *.json *.md *.txt *.gradle *.kts *.yml *.yaml *.ini *.cfg *.pro);;Toate fișierele (*)",
+            "Fișiere text/cod și ZIP (*.py *.kt *.java *.xml *.json *.md *.txt *.gradle *.kts *.yml *.yaml *.ini *.cfg *.pro *.zip);;Toate fișierele (*)",
         )
         if not paths:
             return
@@ -865,19 +866,46 @@ class MainWindow(QMainWindow):
         self.attach_label.setText(f"{len(names)} atașate: {preview}")
         self.clear_attach_btn.setEnabled(True)
 
-    def _format_attachments(self) -> str:
+    def def _format_attachments(self) -> str:
         if not self.attached_files:
             return ""
         blocks: list[str] = []
+        total_chars = 0
+        max_total = 150000  # limită totală de siguranță (~40k tokeni)
+        skip_parts = {".git", ".venv", "venv", "__pycache__", "node_modules", "build", ".gradle", ".idea"}
+
         for raw_path in self.attached_files:
+            if total_chars >= max_total:
+                break
             p = Path(raw_path)
-            try:
-                content = p.read_text(encoding="utf-8", errors="replace")
-                if len(content) > 25000:
-                    content = content[:25000] + "\n… [tăiat la 25.000 caractere]"
-                blocks.append(f"### {p.name}\n```\n{content}\n```")
-            except OSError as exc:
-                self._on_console(f"⚠ Nu am putut citi fișierul atașat {p.name}: {exc}")
+            if p.suffix.lower() == ".zip":
+                try:
+                    with zipfile.ZipFile(p, "r") as zf:
+                        for info in zf.infolist():
+                            if info.is_dir() or total_chars >= max_total:
+                                continue
+                            inner = Path(info.filename)
+                            if any(part in skip_parts for part in inner.parts):
+                                continue
+                            if inner.suffix.lower() not in TEXT_SUFFIXES or info.file_size > 100000:
+                                continue
+                            content = zf.read(info).decode("utf-8", errors="replace")
+                            if len(content) > 25000:
+                                content = content[:25000] + "\n… [tăiat]"
+                            blocks.append(f"### {p.name} :: {info.filename}\n```\n{content}\n```")
+                            total_chars += len(content)
+                except (OSError, zipfile.BadZipFile) as exc:
+                    self._on_console(f"⚠ Nu am putut citi arhiva {p.name}: {exc}")
+            else:
+                try:
+                    content = p.read_text(encoding="utf-8", errors="replace")
+                    if len(content) > 25000:
+                        content = content[:25000] + "\n… [tăiat]"
+                    blocks.append(f"### {p.name}\n```\n{content}\n```")
+                    total_chars += len(content)
+                except OSError as exc:
+                    self._on_console(f"⚠ Nu am putut citi fișierul atașat {p.name}: {exc}")
+
         if not blocks:
             return ""
         return "\n\n--- Fișiere atașate de utilizator ca referință ---\n" + "\n\n".join(blocks)
