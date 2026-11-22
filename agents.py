@@ -466,12 +466,22 @@ def apply_patches(original: str, raw: str) -> str:
             updated = updated.replace(search_block.strip(), replace_block.strip(), 1)
     return updated.strip("\n") + "\n"
 
+def list_ollama_models(base_url: str = OLLAMA_URL) -> list[str]:
+    """Returnează lista modelelor instalate local în Ollama."""
+    try:
+        response = requests.get(f"{base_url.rstrip('/')}/api/tags", timeout=3)
+        response.raise_for_status()
+        return [m.get("name", "") for m in response.json().get("models", []) if m.get("name")]
+    except (requests.RequestException, ValueError):
+        return []
+
 class QwenWorker:
     """Scrie cod prin Ollama, cu streaming live și suport pentru Stop."""
 
-    def __init__(self, base_url: str = OLLAMA_URL, model: str = QWEN_MODEL) -> None:
+    def __init__(self, base_url: str = OLLAMA_URL, model: str = QWEN_MODEL, num_thread: int = 0) -> None:
         self.base_url = base_url.rstrip("/")
         self.model = model
+        self.num_thread = num_thread
         self.last_truncated = False
 
     def check_available(self) -> Optional[str]:
@@ -532,16 +542,22 @@ class QwenWorker:
         _check_cancel(cancel)
         self.last_truncated = False
         payload = {
+            options: dict[str, Any] = {
+            "num_ctx": QWEN_NUM_CTX,
+            "num_predict": QWEN_NUM_PREDICT,
+            "temperature": 0.2,
+            "top_p": 0.9,
+        }
+        if self.num_thread > 0:
+            options["num_thread"] = self.num_thread
+        payload = {
             "model": self.model,
             "system": system,
             "prompt": prompt,
             "stream": True,
             "keep_alive": "30m",
-            "options": {
-                "num_ctx": QWEN_NUM_CTX,
-                "num_predict": QWEN_NUM_PREDICT,
-                "temperature": 0.2,
-                "top_p": 0.9,
+            "options": options,
+        }
             },
         }
         url = f"{self.base_url}/api/generate"
