@@ -19,6 +19,7 @@ GEMINI_MODELS = [
 GEMINI_MODEL = GEMINI_MODELS[0]
 OLLAMA_URL = "http://localhost:11434"
 QWEN_MODEL = "qwen2.5-coder:14b"
+QWEN_NUM_THREAD = 6                # 0 = auto (toate thread-urile); 4-6 ține laptopul mai rece
 QWEN_NUM_CTX = 8192
 QWEN_NUM_PREDICT = 4096            # tokeni maximi generați de Qwen per fișier
 QWEN_PROMPT_CHAR_BUDGET = 12000    # ~3500 tokeni de prompt, restul rămâne pentru răspuns
@@ -85,6 +86,9 @@ class Settings:
     github_private: bool = True
     last_dir: str = ""
     last_type: str = "Python"
+    ollama_model: str = QWEN_MODEL
+    gemini_model: str = GEMINI_MODEL
+    ollama_threads: int = QWEN_NUM_THREAD
 
     @classmethod
     def load(cls) -> "Settings":
@@ -94,6 +98,12 @@ class Settings:
             return values.get(key) or os.environ.get(key, "")
 
         last_type = values.get("LAST_PROJECT_TYPE", "Python")
+        gemini_model = values.get("GEMINI_MODEL", GEMINI_MODEL)
+        try:
+            threads = int(values.get("OLLAMA_THREADS", str(QWEN_NUM_THREAD)))
+        except ValueError:
+            threads = QWEN_NUM_THREAD
+
         return cls(
             gemini_api_key=pick("GEMINI_API_KEY"),
             github_token=pick("GITHUB_TOKEN"),
@@ -101,6 +111,9 @@ class Settings:
             github_private=values.get("GITHUB_PRIVATE", "true").lower() != "false",
             last_dir=values.get("LAST_PROJECT_DIR", ""),
             last_type=last_type if last_type in PROJECT_TYPES else "Python",
+            ollama_model=values.get("OLLAMA_MODEL", QWEN_MODEL) or QWEN_MODEL,
+            gemini_model=gemini_model if gemini_model in GEMINI_MODELS else GEMINI_MODEL,
+            ollama_threads=max(0, min(32, threads)),
         )
 
     def save(self) -> None:
@@ -111,8 +124,10 @@ class Settings:
             "GITHUB_PRIVATE": "true" if self.github_private else "false",
             "LAST_PROJECT_DIR": self.last_dir,
             "LAST_PROJECT_TYPE": self.last_type,
+            "OLLAMA_MODEL": self.ollama_model,
+            "GEMINI_MODEL": self.gemini_model,
+            "OLLAMA_THREADS": str(self.ollama_threads),
         })
-
 
 # --------------------------------------------------------------------------- #
 # Utilitare de cale
