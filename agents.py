@@ -169,6 +169,17 @@ CHAT_SCHEMA = """{
   ]
 }"""
 
+QUESTIONNAIRE_SCHEMA = """{
+  "intro": "1-2 propoziții scurte în română: de ce pui aceste întrebări",
+  "questions": [
+    {
+      "id": "q1",
+      "question": "Întrebare clară, pe înțelesul oricui, în limba română",
+      "multiple": false,
+      "options": ["Varianta A", "Varianta B", "Varianta C"]
+    }
+  ]
+}"""
 
 class GeminiArchitect:
     """Arhitect și Reviewer bazat pe `google-genai`."""
@@ -268,6 +279,46 @@ Răspunde DOAR cu JSON valid, exact în această schemă:
         message = str(data.get("message", "")).strip() or "Planul este gata, încep implementarea."
         self._remember(requirements, message)
         return {"message": message, "entry_file": entry, "files": steps}
+
+    # ----- chestionar de clarificare --------------------------------------- #
+    def clarify(self, requirements: str, project_type: str,
+                cancel: Optional[threading.Event] = None) -> dict[str, Any]:
+        """Generează un chestionar interactiv (8-15 întrebări în română) pentru a clarifica cerințele."""
+        prompt = f"""Tip proiect: {project_type}
+
+Ideea / cerința inițială a utilizatorului:
+{requirements}
+
+Sarcină: creează un chestionar de clarificare cu 8 până la 15 întrebări (câte sunt cu adevărat utile, fără umplutură)
+pentru a înțelege exact ce își dorește utilizatorul înainte de a proiecta arhitectura.
+Reguli:
+- Scrie TOTUL în limba română simplă, prietenoasă, pe înțelesul oricui (evită jargonul inutil).
+- Acoperă aspecte concrete: funcționalități principale, interfață/design, stocare date, autentificare/rețea,
+  comportament în cazuri speciale, preferințe de utilizare.
+- Pentru fiecare întrebare oferă 3-5 variante clare și realiste în `options`.
+- Setează `"multiple": true` dacă utilizatorul poate alege mai multe variante, sau `"false"` dacă alege una singură.
+Răspunde DOAR cu JSON valid, exact în această schemă:
+{QUESTIONNAIRE_SCHEMA}"""
+        data = self._json_call(prompt, use_history=False, cancel=cancel)
+        raw_q = data.get("questions") or []
+        questions: list[dict[str, Any]] = []
+        for idx, item in enumerate(raw_q, 1):
+            if not isinstance(item, dict):
+                continue
+            q_text = str(item.get("question", "")).strip()
+            opts = [str(o).strip() for o in (item.get("options") or []) if str(o).strip()]
+            if not q_text or not opts:
+                continue
+            questions.append({
+                "id": str(item.get("id") or f"q{idx}"),
+                "question": q_text,
+                "multiple": bool(item.get("multiple", False)),
+                "options": opts[:6],
+            })
+        if not questions:
+            raise AgentError("Gemini nu a generat întrebări valide pentru chestionar.")
+        intro = str(data.get("intro", "")).strip() or "Răspunde la câteva întrebări scurte ca să construiesc exact ce vrei."
+        return {"intro": intro, "questions": questions}
 
     # ----- review ---------------------------------------------------------- #
     def review(self, rel: str, description: str, requirements: str, code: str, run_log: str,
