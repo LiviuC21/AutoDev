@@ -541,8 +541,7 @@ class QwenWorker:
                  cancel: Optional[threading.Event] = None) -> str:
         _check_cancel(cancel)
         self.last_truncated = False
-        payload = {
-            options: dict[str, Any] = {
+        options: dict[str, Any] = {
             "num_ctx": QWEN_NUM_CTX,
             "num_predict": QWEN_NUM_PREDICT,
             "temperature": 0.2,
