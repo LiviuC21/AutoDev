@@ -558,8 +558,6 @@ class QwenWorker:
             "keep_alive": "30m",
             "options": options,
         }
-            },
-        }
         url = f"{self.base_url}/api/generate"
         try:
             response = run_cancellable(
