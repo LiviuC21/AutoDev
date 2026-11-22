@@ -403,7 +403,8 @@ before or after the block. No placeholders, no TODO, no "..." elisions: the file
 Use the exact names, imports and signatures given in the requirements and in the other project files shown.
 Do not import modules that are not part of the project or the standard library unless the requirements list them.
 Write comments and docstrings in Romanian; keep identifiers in English.
-If a previous version and review notes are provided, apply EVERY correction and return the whole corrected file."""
+If a previous version and review notes are provided, apply EVERY correction and return the whole corrected file.
+If you strictly need to inspect the full code of another project file not shown in context, reply ONLY with: NEED_FILE: path/to/file"""
 
 _FENCE_RE = re.compile(r"```[ \t]*[\w+#.\-]*[ \t]*\n(.*?)```", re.S)
 
@@ -443,7 +444,8 @@ new replacement lines
 Rules:
 - Copy the SEARCH lines EXACTLY as they appear in the current file (same indentation and spacing).
 - Keep SEARCH blocks short (3-10 lines of context) so they match uniquely.
-- Never output the whole file unless every single line changes. No explanations outside the blocks."""
+- Never output the whole file unless every single line changes. No explanations outside the blocks.
+- If you strictly need to inspect another project file not shown in context, reply ONLY with: NEED_FILE: path/to/file"""
 
 _PATCH_RE = re.compile(
     r"<<<<<<< SEARCH\s*\n(.*?)\n=======\s*\n(.*?)\n>>>>>>> REPLACE",
@@ -465,6 +467,17 @@ def apply_patches(original: str, raw: str) -> str:
         elif search_block.strip() and search_block.strip() in updated:
             updated = updated.replace(search_block.strip(), replace_block.strip(), 1)
     return updated.strip("\n") + "\n"
+
+_NEED_FILE_RE = re.compile(r"^\s*NEED_FILE:\s*([^\n\r`]+)", re.I)
+
+
+def parse_need_file(raw: str) -> Optional[str]:
+    """Returnează calea cerută dacă modelul a răspuns cu `NEED_FILE: ...`, altfel None."""
+    cleaned = raw.strip()
+    if len(cleaned) > 300:
+        return None
+    match = _NEED_FILE_RE.match(cleaned)
+    return normalize_rel(match.group(1)) if match else None
 
 def list_ollama_models(base_url: str = OLLAMA_URL) -> list[str]:
     """Returnează lista modelelor instalate local în Ollama."""
@@ -500,6 +513,7 @@ class QwenWorker:
     def build_prompt(self, rel: str, description: str, requirements: str, project_type: str,
                      project_files: Optional[list[str]] = None,
                      context: Optional[dict[str, str]] = None,
+                     project_map: Optional[str] = None,
                      previous_code: Optional[str] = None,
                      feedback: Optional[str] = None) -> tuple[str, str]:
         """Construiește (system, prompt) încadrat în QWEN_PROMPT_CHAR_BUDGET."""
@@ -511,6 +525,8 @@ class QwenWorker:
         if project_files:
             names = "\n".join(f"- {f}" for f in project_files[:60])
             head += f"\nProject files:\n{names}\n"
+        if project_map:
+            head += f"\nProject signatures map (other files):\n{_clip(project_map, 2500)}\n"
         footer = (
             f"\nReturn ONLY SEARCH/REPLACE blocks to update {rel}."
             if is_edit
@@ -623,14 +639,29 @@ class QwenWorker:
     def write_file(self, rel: str, description: str, requirements: str, project_type: str,
                    project_files: Optional[list[str]] = None,
                    context: Optional[dict[str, str]] = None,
+                   project_map: Optional[str] = None,
+                   on_need_file: Optional[Callable[[str], Optional[str]]] = None,
                    previous_code: Optional[str] = None,
                    feedback: Optional[str] = None,
                    on_token: Optional[Callable[[str], None]] = None,
                    cancel: Optional[threading.Event] = None) -> str:
-        """Generează conținutul complet al unui fișier și îl returnează curățat de fence-uri."""
-        system, prompt = self.build_prompt(
-            rel, description, requirements, project_type, project_files, context, previous_code, feedback)
-        raw = self.generate(system, prompt, on_token, cancel)
+        """Generează conținutul complet al unui fișier, cu suport pentru cereri NEED_FILE."""
+        ctx = dict(context or {})
+        raw = ""
+        for _ in range(3):  # maxim 2 cereri NEED_FILE + generarea finală
+            system, prompt = self.build_prompt(
+                rel, description, requirements, project_type,
+                project_files, ctx, project_map, previous_code, feedback,
+            )
+            raw = self.generate(system, prompt, on_token, cancel)
+            requested = parse_need_file(raw) if on_need_file is not None else None
+            if requested and requested not in ctx:
+                extra = on_need_file(requested)
+                if extra is not None:
+                    ctx[requested] = extra
+                    continue
+            break
+
         if previous_code and previous_code.strip():
             code = apply_patches(previous_code, raw)
         else:
