@@ -341,6 +341,27 @@ class PipelineWorker(QThread):
         self.console.emit(f"{'✔' if result.ok else '✘'} {result.summary}")
         return f" GitHub: {result.summary}"
 
+    def _final_audit(self) -> list[str]:
+        """Rulează auditul global Gemini și aplică automat eventualele corecții de integrare."""
+        architect = self.session.architect
+        assert architect is not None
+        self._check()
+        files = list_project_files(self.project_dir)
+        self.agent_log.emit("🔎 Gemini face auditul final pe tot proiectul…", "info")
+        audit = architect.audit(self.text, self.project_type, files,
+                                self._read_files(files, 80000), self.cancel)
+        self.chat_message.emit("Gemini (Audit)", audit["summary"])
+        tasks = audit["tasks"]
+        if not tasks:
+            self.agent_log.emit(f"✔ Audit final OK: {audit['summary']}", "ok")
+            return []
+        self.agent_log.emit(
+            "🛠 Auditul a găsit corecții de integrare:\n"
+            + "\n".join(f"• {t['path']} — {t['description']}" for t in tasks),
+            "warn",
+        )
+        return self._run_steps(tasks)
+
     # ----- moduri ---------------------------------------------------------- #
     def _build(self) -> tuple[bool, str]:
         architect = self.session.architect
@@ -364,6 +385,8 @@ class PipelineWorker(QThread):
 
         self._save_progress(plan["files"], [], done=False)
         failed = self._run_steps(plan["files"], completed=[], save_checkpoint=True)
+        if not failed:
+            failed.extend(self._final_audit())
         if "android" in self.project_type.lower():
             proj_path = Path(self.project_dir)
             pkg = f"com.autodev.{re.sub(r'[^A-Za-z0-9]', '', proj_path.name).lower() or 'autodevapp'}"
@@ -407,6 +430,8 @@ class PipelineWorker(QThread):
             f"▶ Reluare din checkpoint: {len(completed)}/{len(steps)} fișiere deja terminate.", "plan"
         )
         failed = self._run_steps(steps, completed=completed, save_checkpoint=True)
+        if not failed:
+            failed.extend(self._final_audit())
 
         if "android" in self.project_type.lower():
             proj_path = Path(self.project_dir)
