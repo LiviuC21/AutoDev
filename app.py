@@ -33,6 +33,7 @@ from github_manager import push_project
 TEXT_SUFFIXES = {
     ".py", ".kt", ".java", ".xml", ".json", ".txt", ".gradle", ".kts", ".md",
     ".properties", ".toml", ".cfg", ".ini", ".yml", ".yaml", ".pro",
+    ".html", ".htm", ".css", ".js", ".ts", ".cpp", ".cc", ".cxx", ".h", ".hpp", ".c",
 }
 MAX_CONTEXT_FILE_BYTES = 20000
 
