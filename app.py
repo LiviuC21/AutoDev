@@ -13,6 +13,7 @@ from runner import deploy_and_capture_android, open_android_studio, prepare_andr
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
+from remote_api import RemoteAPIServer
 
 from PyQt6.QtCore import QSettings, Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import QColor, QKeySequence, QPalette, QShortcut, QTextCursor
@@ -657,6 +658,10 @@ class MainWindow(QMainWindow):
         self.worker: Optional[PipelineWorker] = None
         self.cancel = threading.Event()
         self.attached_files: list[str] = []
+        self.remote_api = RemoteAPIServer(port=8765, parent=self)
+        self.remote_api.stop_requested.connect(self._stop)
+        self.remote_api.resume_requested.connect(self._resume)
+        self.remote_api.feedback_requested.connect(self._on_remote_feedback)
         self._build_ui()
         self._restore()
         self.clarify_worker: Optional[ClarifyWorker] = None
@@ -732,6 +737,13 @@ class MainWindow(QMainWindow):
 
         self.temp_label = QLabel("🌡️ --°C")
         self.temp_label.setToolTip("Temperatura CPU în timp real (k10temp)")
+
+        self.api_check = QCheckBox("📡 API :8765")
+        self.api_check.setToolTip("Pornește serverul API pentru telecomanda Android (Tailscale)")
+        bar2.addSpacing(14)
+        bar2.addWidget(self.api_check)
+        bar2.addStretch(1)
+        bar2.addWidget(self.temp_label)
 
         bar2.addWidget(QLabel("Model local (Ollama):"))
         bar2.addWidget(self.ollama_combo)
@@ -820,6 +832,7 @@ class MainWindow(QMainWindow):
         self.ollama_combo.currentTextChanged.connect(self._persist_choice)
         self.gemini_combo.currentTextChanged.connect(self._persist_choice)
         self.threads_spin.valueChanged.connect(self._persist_choice)
+        self.api_check.toggled.connect(self._toggle_api)
 
         self.temp_timer = QTimer(self)
         self.temp_timer.timeout.connect(self._update_temp)
@@ -856,6 +869,7 @@ class MainWindow(QMainWindow):
     def _on_agent_log(self, text: str, kind: str) -> None:
         self._append(self.agent_view, text, COLORS.get(kind, COLORS["info"]))
         self.agent_view.append("")
+        self.remote_api.push_agent_log(text)
 
     def _on_console(self, text: str) -> None:
         for line in text.splitlines() or [""]:
@@ -872,11 +886,13 @@ class MainWindow(QMainWindow):
             else:
                 color = "#c9ccd1"
             self._append(self.console_view, line, color)
+            self.remote_api.push_console_log(text)
 
     def _on_code_set(self, title: str, text: str) -> None:
         self.code_title.setText(f"Cod generat de Qwen — {title}")
         self.code_view.setPlainText(text)
         self.code_view.moveCursor(QTextCursor.MoveOperation.End)
+        self.remote_api.update_status(current_file=title)
 
     def _on_code_chunk(self, chunk: str) -> None:
         self.code_view.moveCursor(QTextCursor.MoveOperation.End)
@@ -934,6 +950,7 @@ class MainWindow(QMainWindow):
             self.settings.save()
         except OSError:
             pass
+        self._sync_api_status()
 
     def _open_settings(self) -> None:
         SettingsDialog(self.settings, self).exec()
@@ -960,6 +977,7 @@ class MainWindow(QMainWindow):
             self.resume_button.setEnabled(False)
         else:
             self._update_resume_button()
+        self._sync_api_status()
 
     def _ensure_session(self, project_dir: str, project_type: str) -> bool:
         key = self.settings.gemini_api_key
@@ -1156,6 +1174,7 @@ class MainWindow(QMainWindow):
         else:
             self.resume_button.setText("▶ Continuă")
             self.resume_button.setEnabled(False)
+            self._sync_api_status()
 
     def _resume(self) -> None:
         if self.worker is not None and self.worker.isRunning():
@@ -1189,10 +1208,46 @@ class MainWindow(QMainWindow):
         self._on_agent_log("━━ Reluare proiect din checkpoint ━━", "plan")
         worker.start()
 
+    def _toggle_api(self, enabled: bool) -> None:
+        if enabled:
+            if self.remote_api.start():
+                self._on_console("📡 Server API pornit pe portul 8765 (accesibil prin Tailscale).")
+                self._sync_api_status()
+            else:
+                self.api_check.setChecked(False)
+                self._on_console("✘ Nu am putut porni serverul API pe portul 8765 (port ocupat?).")
+        else:
+            self.remote_api.stop()
+            self._on_console("📡 Server API oprit.")
+
+    def _sync_api_status(self) -> None:
+        project_dir = self.dir_edit.text().strip()
+        state = load_state(project_dir)
+        done_cnt = len(state.get("completed", [])) if state else 0
+        total_cnt = len(state.get("steps", [])) if state else 0
+        running = (self.worker is not None and self.worker.isRunning())
+        self.remote_api.update_status(
+            running=running,
+            project_dir=project_dir,
+            project_type=self.type_combo.currentText(),
+            ollama_model=self.ollama_combo.currentText(),
+            gemini_model=self.gemini_combo.currentText(),
+            can_resume=self.resume_button.isEnabled(),
+            progress_done=done_cnt,
+            progress_total=total_cnt,
+        )
+
+    def _on_remote_feedback(self, message: str) -> None:
+        if self.worker is not None and self.worker.isRunning():
+            return
+        self.input.setPlainText(message)
+        self._send()
+
     def closeEvent(self, event) -> None:  # noqa: N802 - convenția Qt
         if self.worker is not None and self.worker.isRunning():
             self.cancel.set()
             self.worker.wait(4000)
+        self.remote_api.stop()
         super().closeEvent(event)
 
 
