@@ -141,7 +141,10 @@ Proiecte Python: țintă Linux, Python 3.11+, rulează într-un .venv. Doar fiș
 este `requirements.txt`. Proiecte Android: Kotlin + Gradle, structură standard (app/src/main/...).Reguli stricte de UI/UX (Design 2026):
 - Pentru aplicații desktop Python cu GUI, NU folosi Tkinter standard. Folosește PyQt6 (cu Fusion + stylesheet QSS modern) sau CustomTkinter (dark mode), adăugând librăria în requirements.txt.
 - Design modern: temă dark curată (#18181b / #27272a), culori de accent moderne (ex. #3b82f6 sau #8b5cf6), colțuri rotunjite (border-radius 8px-10px), spațiere generoasă (padding/margins), etichete clare și placeholder-e pe fiecare câmp de input, butoane cu efect hover și layout aerisit.
-- Pentru aplicații Android: folosește Material Design 3 (MaterialComponents / Jetpack Compose sau XML modern cu carduri rotunjite, temă dark/dinamică și spațiere corectă). """
+- Pentru aplicații Android: folosește Material Design 3 (MaterialComponents / Jetpack Compose sau XML modern cu carduri rotunjite, temă dark/dinamică și spațiere corectă).
+- Proiecte Web: HTML5 + CSS3 + JavaScript modern (fără build-step obligatoriu, fișier de intrare `index.html`), design responsive și temă dark curată.
+- Proiecte C++: C++17/20 standard, fișier de intrare `main.cpp`, cod portabil (Linux și Windows/MinGW), fără dependențe externe care nu sunt standard decât dacă utilizatorul le cere explicit.
+- Proiecte Java: JDK 17+, structură curată cu fișier de intrare `Main.java` (cu `public static void main`), fără dependențe externe obligatorii (sau cu `pom.xml`/`build.gradle` doar dacă se cere)."""
 
 PLAN_SCHEMA = """{
   "message": "scurt răspuns pentru utilizator (2-4 propoziții): ce vei construi",
