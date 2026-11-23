@@ -32,6 +32,12 @@ def _check_cancel(cancel: Optional[threading.Event]) -> None:
     if cancel is not None and cancel.is_set():
         raise Cancelled()
 
+def _sleep_cancellable(seconds: int, cancel: Optional[threading.Event]) -> None:
+    """Așteaptă `seconds` secunde, verificând la fiecare 0.25s dacă s-a apăsat Stop."""
+    end = time.monotonic() + seconds
+    while time.monotonic() < end:
+        _check_cancel(cancel)
+        time.sleep(min(0.25, max(0.0, end - time.monotonic())))
 
 def run_cancellable(func: Callable[[], Any], cancel: Optional[threading.Event]) -> Any:
     """Rulează o funcție blocantă într-un thread și o abandonează dacă se apasă Stop."""
@@ -206,6 +212,8 @@ class GeminiArchitect:
         self.client = genai.Client(api_key=api_key)
         self.model = model
         self.history: list[tuple[str, str]] = []  # (rol, text), rol = "user" | "model"
+        self.on_status: Optional[Callable[[str], None]] = None
+        self.on_quota_wait: Optional[Callable[[], None]] = None
 
     # ----- apel de bază ---------------------------------------------------- #
     def _contents(self, prompt: str, use_history: bool) -> list[types.Content]:
@@ -216,6 +224,50 @@ class GeminiArchitect:
         contents.append(types.Content(role="user", parts=[types.Part(text=prompt)]))
         return contents
 
+    def _call_with_retry(self, contents: list[types.Content], config: types.GenerateContentConfig,
+                         cancel: Optional[threading.Event]) -> str:
+        """Încearcă toate modelele; la 429/cotă așteaptă 60s, apoi intră în așteptare 15 min până revine cota."""
+        round_num = 0
+        while True:
+            round_num += 1
+            models_to_try = [self.model] + [m for m in GEMINI_MODELS if m != self.model]
+            for model_name in models_to_try:
+                _check_cancel(cancel)
+                try:
+                    response = run_cancellable(
+                        lambda m=model_name: self.client.models.generate_content(
+                            model=m, contents=contents, config=config),
+                        cancel,
+                    )
+                    if model_name != self.model and self.on_status:
+                        self.on_status(f"🔄 Gemini a trecut automat pe modelul: {model_name}")
+                    self.model = model_name
+                    return (response.text or "").strip()
+                except Cancelled:
+                    raise
+                except Exception as exc:  # noqa: BLE001
+                    msg = str(exc).lower()
+                    if any(k in msg for k in TRANSIENT_MARKERS):
+                        if self.on_status:
+                            self.on_status(f"⚠ Limită/eroare temporară pe {model_name}, încerc următorul model…")
+                        continue
+                    raise AgentError(f"Eroare Gemini ({model_name}): {exc}") from exc
+
+            # Toate modelele au dat 429 / 503 în runda curentă
+            if round_num == 1:
+                wait_sec = 60
+                if self.on_status:
+                    self.on_status("⏳ Limită atinsă pe toate modelele Gemini. Aștept 60s și reîncerc automat…")
+            else:
+                wait_sec = 900  # 15 minute
+                if self.on_quota_wait:
+                    self.on_quota_wait()
+                if self.on_status:
+                    self.on_status(
+                        "⏳ Cotă Gemini epuizată. Am eliberat RAM-ul Ollama și reîncerc automat peste 15 min (poți apăsa Stop oricând)…"
+                    )
+            _sleep_cancellable(wait_sec, cancel)
+
     def _generate(self, prompt: str, json_mode: bool, use_history: bool,
                   cancel: Optional[threading.Event]) -> str:
         contents = self._contents(prompt, use_history)
@@ -223,27 +275,7 @@ class GeminiArchitect:
         if json_mode:
             kwargs["response_mime_type"] = "application/json"
         config = types.GenerateContentConfig(**kwargs)
-        last_error: Optional[BaseException] = None
-        models_to_try = [self.model] + [m for m in GEMINI_MODELS if m != self.model]
-        for model_name in models_to_try:
-            _check_cancel(cancel)
-            try:
-                response = run_cancellable(
-                    lambda m=model_name: self.client.models.generate_content(
-                        model=m, contents=contents, config=config),
-                    cancel,
-                )
-                self.model = model_name
-                return (response.text or "").strip()
-            except Cancelled:
-                raise
-            except Exception as exc:  # noqa: BLE001
-                last_error = exc
-                msg = str(exc)
-                if any(k in msg for k in ("429", "503", "RESOURCE_EXHAUSTED", "UNAVAILABLE")):
-                    continue
-                raise AgentError(f"Eroare Gemini ({model_name}): {exc}") from exc
-        raise AgentError(f"Toate modelele Gemini au atins limita: {last_error}")
+        return self._call_with_retry(contents, config, cancel)
 
     def _json_call(self, prompt: str, use_history: bool, cancel: Optional[threading.Event]) -> dict[str, Any]:
         current = prompt
@@ -469,29 +501,7 @@ Răspunde DOAR cu JSON valid, exact în această schemă:
             system_instruction="You are a strict Android UI/UX reviewer.",
             temperature=0.2,
         )
-        last_error: Optional[BaseException] = None
-        models_to_try = [self.model] + [m for m in GEMINI_MODELS if m != self.model]
-        raw = ""
-        for model_name in models_to_try:
-            _check_cancel(cancel)
-            try:
-                response = run_cancellable(
-                    lambda m=model_name: self.client.models.generate_content(
-                        model=m, contents=contents, config=config),
-                    cancel,
-                )
-                self.model = model_name
-                raw = (response.text or "").strip()
-                break
-            except Cancelled:
-                raise
-            except Exception as exc:  # noqa: BLE001
-                last_error = exc
-                if any(k in str(exc) for k in ("429", "503", "RESOURCE_EXHAUSTED", "UNAVAILABLE")):
-                    continue
-                raise AgentError(f"Eroare Gemini Vision ({model_name}): {exc}") from exc
-        else:
-            raise AgentError(f"Toate modelele Gemini au atins limita: {last_error}")
+        raw = self._call_with_retry(contents, config, cancel)
 
         lines = raw.splitlines() or ["REFA"]
         first, rest = lines[0], lines[1:]
@@ -612,6 +622,17 @@ class QwenWorker:
         if self.model not in names and f"{self.model}:latest" not in names:
             return f"Modelul {self.model} nu este descărcat. Rulează: ollama pull {self.model}"
         return None
+
+    def unload(self) -> None:
+        """Eliberează imediat modelul din memoria RAM/VRAM a Ollama (keep_alive: 0)."""
+        try:
+            requests.post(
+                f"{self.base_url}/api/generate",
+                json={"model": self.model, "keep_alive": 0},
+                timeout=5,
+            )
+        except requests.RequestException:
+            pass
 
     # ----- prompt ---------------------------------------------------------- #
     def build_prompt(self, rel: str, description: str, requirements: str, project_type: str,
