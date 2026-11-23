@@ -181,6 +181,19 @@ QUESTIONNAIRE_SCHEMA = """{
   ]
 }"""
 
+AUDIT_SCHEMA = """{
+  "ok": true,
+  "summary": "scurt rezumat în română al verificării globale (1-3 propoziții)",
+  "tasks": [
+    {
+      "path": "fișier de creat sau modificat",
+      "description": "rolul fișierului în engleză",
+      "requirements": "descrierea COMPLETĂ și concretă în ENGLEZĂ a ce trebuie reparat sau adăugat",
+      "depends_on": ["fișiere de care depinde"]
+    }
+  ]
+}"""
+
 class GeminiArchitect:
     """Arhitect și Reviewer bazat pe `google-genai`."""
 
@@ -389,6 +402,43 @@ Răspunde DOAR cu JSON valid, exact în această schemă:
         entry = normalize_rel(str(data.get("entry_file", "")))
         self._remember(message, reply)
         return {"reply": reply, "entry_file": entry, "tasks": tasks}
+
+
+    # ----- audit final global ---------------------------------------------- #
+    def audit(self, goal: str, project_type: str, files: list[str],
+              contents: Optional[dict[str, str]] = None,
+              cancel: Optional[threading.Event] = None) -> dict[str, Any]:
+        """Verifică global întreg proiectul după finalizare. Returnează {"ok", "summary", "tasks"}."""
+        listing = "\n".join(f"- {f}" for f in files) or "(niciun fișier)"
+        prompt = f"""Proiectul ({project_type}) tocmai a fost generat. Fă un AUDIT FINAL amănunțit pe tot proiectul.
+
+Cerința inițială a utilizatorului:
+{goal}
+
+Fișierele proiectului:
+{listing}
+
+Conținutul fișierelor:
+{_format_files(contents)}
+
+Verifică strict:
+1. Toate importurile și apelurile dintre fișiere se potrivesc exact (nume de clase, funcții, argumente, rute)?
+2. Lipsește vreo funcționalitate importantă cerută de utilizator?
+3. Există fișiere incomplete, placeholdere (`TODO`, `pass`) sau bug-uri evidente de integrare?
+
+Reguli:
+- Dacă proiectul este complet și modulele se leagă corect, pune `"ok": true` și `"tasks": []`.
+- Nu cere modificări cosmetice sau de stil. Pune în `tasks` DOAR reparații reale de integrare sau funcții lipsă.
+- Scrie `summary` în ROMÂNĂ, dar `description` și `requirements` din `tasks` în ENGLEZĂ (pentru modelul local).
+Răspunde DOAR cu JSON valid, exact în această schemă:
+{AUDIT_SCHEMA}"""
+        data = self._json_call(prompt, use_history=False, cancel=cancel)
+        tasks = _clean_steps(data.get("tasks"))
+        ok = bool(data.get("ok", not tasks)) and not tasks
+        summary = str(data.get("summary", "")).strip() or (
+            "Auditul final nu a găsit probleme de integrare." if ok else "Auditul a găsit câteva corecții necesare."
+        )
+        return {"ok": ok, "summary": summary, "tasks": tasks}
 
 # ----- review vizual (Vision) ------------------------------------------ #
     def review_screenshot(self, image_path: Path, app_goal: str,
