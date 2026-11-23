@@ -26,7 +26,7 @@ QWEN_PROMPT_CHAR_BUDGET = 12000    # ~3500 tokeni de prompt, restul rămâne pen
 MAX_ATTEMPTS = 5                   # încercări per fișier
 RUN_TIMEOUT = 10                   # secunde de rulare pentru testul unui fișier Python
 
-PROJECT_TYPES = ("Python", "Android")
+PROJECT_TYPES = ("Python", "Android", "Web", "C++", "Java")
 
 IGNORED_DIRS = {
     ".git", ".venv", "venv", "__pycache__", "node_modules", "build",
