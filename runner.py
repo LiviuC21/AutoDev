@@ -209,6 +209,46 @@ def _validate_python(project_dir: str | Path, rel: str, entry_file: str,
         return run_python_file(project_dir, rel, emit, cancel)
     return _check_import(project_dir, rel, emit, cancel)
 
+def _validate_cpp(project_dir: str | Path, rel: str, emit: Emit,
+                  cancel: Optional[threading.Event]) -> RunResult:
+    if not shutil.which("g++"):
+        emit("⚠ g++ nu este instalat — sar peste verificarea de sintaxă C++.")
+        return RunResult(True, "Salvat (g++ lipsește).")
+    emit(f"▶ Verific sintaxa C++: {rel}")
+    rc, out, _ = stream_command(
+        ["g++", "-fsyntax-only", "-std=c++17", rel], project_dir, emit, 30, cancel
+    )
+    if rc == 0:
+        return RunResult(True, "Sintaxă C++ validă.", out)
+    return RunResult(False, "Eroare de compilare C++.", out)
+
+
+def _validate_java(project_dir: str | Path, rel: str, emit: Emit,
+                   cancel: Optional[threading.Event]) -> RunResult:
+    if not shutil.which("javac"):
+        emit("⚠ javac (JDK) nu este instalat — sar peste verificarea Java.")
+        return RunResult(True, "Salvat (javac lipsește).")
+    out_dir = Path(project_dir) / ".build_java"
+    out_dir.mkdir(exist_ok=True)
+    emit(f"▶ Compilez Java: {rel}")
+    rc, out, _ = stream_command(
+        ["javac", "-d", str(out_dir), "-sourcepath", ".", rel], project_dir, emit, 45, cancel
+    )
+    if rc == 0:
+        return RunResult(True, "Compilare Java reușită.", out)
+    return RunResult(False, "Eroare de compilare Java.", out)
+
+
+def _validate_js(project_dir: str | Path, rel: str, emit: Emit,
+                 cancel: Optional[threading.Event]) -> RunResult:
+    if not shutil.which("node"):
+        emit(f"✔ Salvat: {rel} (node nu este instalat pentru verificare JS)")
+        return RunResult(True, "Salvat (fără verificare node).")
+    emit(f"▶ Verific sintaxa JS: {rel}")
+    rc, out, _ = stream_command(["node", "--check", rel], project_dir, emit, 15, cancel)
+    if rc == 0:
+        return RunResult(True, "Sintaxă JavaScript validă.", out)
+    return RunResult(False, "Eroare de sintaxă JavaScript.", out)
 
 def validate_file(project_type: str, project_dir: str | Path, rel: str, entry_file: str,
                   emit: Emit, cancel: Optional[threading.Event]) -> RunResult:
@@ -217,6 +257,12 @@ def validate_file(project_type: str, project_dir: str | Path, rel: str, entry_fi
     suffix = path.suffix.lower()
     if suffix == ".py":
         return _validate_python(project_dir, rel, entry_file, emit, cancel)
+    if suffix in {".cpp", ".cc", ".cxx"}:
+        return _validate_cpp(project_dir, rel, emit, cancel)
+    if suffix == ".java":
+        return _validate_java(project_dir, rel, emit, cancel)
+    if suffix == ".js":
+        return _validate_js(project_dir, rel, emit, cancel)
     if suffix == ".xml":
         try:
             ET.parse(path)
@@ -354,3 +400,100 @@ def deploy_and_capture_android(project_dir: Path, package_name: str, log=None) -
     if log:
         log(f"📸 Captură salvată: {shot.name}")
     return True, shot, "OK"
+
+# --------------------------------------------------------------------------- #
+# Export .exe pentru Windows (C++, Java, Python)
+# --------------------------------------------------------------------------- #
+GITHUB_PYINSTALLER_WORKFLOW = """name: Build Windows EXE
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build-exe:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller
+          if (Test-Path requirements.txt) { pip install -r requirements.txt }
+      - name: Build EXE
+        run: pyinstaller --onefile --noconsole --name "{app_name}" "{entry_file}"
+      - name: Upload EXE artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: {app_name}-windows-exe
+          path: dist/{app_name}.exe
+"""
+
+
+def export_windows_exe(project_type: str, project_dir: str | Path, entry_file: str,
+                       emit: Emit, cancel: Optional[threading.Event] = None) -> RunResult:
+    """Generează (sau pregătește) executabilul .exe pentru Windows în funcție de tipul proiectului."""
+    base = Path(project_dir)
+    app_name = re.sub(r"[^A-Za-z0-9_-]+", "_", base.name).strip("_") or "AutoDevApp"
+    dist_dir = base / "dist"
+    dist_dir.mkdir(exist_ok=True)
+
+    if project_type == "C++":
+        compiler = shutil.which("x86_64-w64-mingw32-g++")
+        if not compiler:
+            msg = "Lipsește cross-compilatorul MinGW. Instalează-l cu: sudo pacman -S mingw-w64-gcc"
+            emit(f"⚠ {msg}")
+            return RunResult(False, msg)
+        cpp_files = sorted(str(p.relative_to(base)) for p in base.rglob("*.cpp"))
+        if not cpp_files:
+            return RunResult(False, "Nu am găsit fișiere .cpp în proiect.")
+        out_exe = dist_dir / f"{app_name}.exe"
+        emit(f"📦 Cross-compilez C++ → {out_exe.name}…")
+        cmd = [compiler, "-std=c++17", "-O2", "-static", "-static-libgcc", "-static-libstdc++",
+               *cpp_files, "-o", str(out_exe)]
+        rc, out, _ = stream_command(cmd, base, emit, 120, cancel)
+        if rc == 0 and out_exe.is_file():
+            return RunResult(True, f"Executabil Windows creat: dist/{out_exe.name}", out)
+        return RunResult(False, "Cross-compilarea C++ a eșuat.", out)
+
+    if project_type == "Java":
+        if not shutil.which("javac") or not shutil.which("jar"):
+            return RunResult(False, "Lipsește JDK (javac/jar). Instalează cu: sudo pacman -S jdk-openjdk")
+        java_files = sorted(str(p.relative_to(base)) for p in base.rglob("*.java"))
+        if not java_files:
+            return RunResult(False, "Nu am găsit fișiere .java în proiect.")
+        build_dir = base / ".build_java"
+        build_dir.mkdir(exist_ok=True)
+        rc, out, _ = stream_command(["javac", "-d", str(build_dir), *java_files], base, emit, 60, cancel)
+        if rc != 0:
+            return RunResult(False, "Compilarea Java a eșuat.", out)
+        main_class = Path(entry_file or "Main.java").stem
+        jar_path = dist_dir / f"{app_name}.jar"
+        rc2, out2, _ = stream_command(
+            ["jar", "cfe", str(jar_path), main_class, "-C", str(build_dir), "."], base, emit, 30, cancel
+        )
+        if rc2 != 0:
+            return RunResult(False, "Crearea arhivei .jar a eșuat.", out2)
+        bat_path = dist_dir / f"Run_{app_name}.bat"
+        bat_path.write_text(f"@echo off\njava -jar \"%~dp0{jar_path.name}\"\npause\n", encoding="utf-8")
+        return RunResult(True, f"Pachet Windows creat: dist/{jar_path.name} + dist/{bat_path.name}", out2)
+
+    if project_type == "Python":
+        entry = entry_file or ("main.py" if (base / "main.py").is_file() else "")
+        if not entry:
+            py_files = sorted(p.name for p in base.glob("*.py"))
+            entry = py_files[0] if py_files else "main.py"
+        wf_dir = base / ".github" / "workflows"
+        wf_dir.mkdir(parents=True, exist_ok=True)
+        wf_file = wf_dir / "build-windows-exe.yml"
+        wf_file.write_text(
+            GITHUB_PYINSTALLER_WORKFLOW.format(app_name=app_name, entry_file=entry),
+            encoding="utf-8",
+        )
+        emit(f"✔ Creat workflow GitHub Actions: {wf_file.relative_to(base)}")
+        emit("💡 Fă push pe GitHub (cu Auto GitHub Push) și descarcă .exe-ul din tab-ul Actions → Artifacts.")
+        return RunResult(True, f"Workflow Windows .exe creat (.github/workflows/build-windows-exe.yml) pentru {entry}.")
+
+    return RunResult(False, f"Exportul .exe nu se aplică pentru proiecte de tip {project_type}.")
