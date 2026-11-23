@@ -9,7 +9,10 @@ import threading
 import time
 import traceback
 import re
-from runner import deploy_and_capture_android, open_android_studio, prepare_android_project, run_gradle_build, validate_file
+from runner import (
+    deploy_and_capture_android, export_windows_exe, open_android_studio,
+    prepare_android_project, run_gradle_build, validate_file,
+)
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -507,6 +510,27 @@ class ClarifyWorker(QThread):
         except Exception as exc:  # noqa: BLE001
             self.failed.emit(str(exc))
 
+class ExportWorker(QThread):
+    console = pyqtSignal(str)
+    done = pyqtSignal(bool, str)
+
+    def __init__(self, project_type: str, project_dir: str, entry_file: str,
+                 cancel: threading.Event) -> None:
+        super().__init__()
+        self.project_type = project_type
+        self.project_dir = project_dir
+        self.entry_file = entry_file
+        self.cancel = cancel
+
+    def run(self) -> None:
+        try:
+            res = export_windows_exe(
+                self.project_type, self.project_dir, self.entry_file,
+                self.console.emit, self.cancel,
+            )
+            self.done.emit(res.ok, res.summary)
+        except Exception as exc:  # noqa: BLE001
+            self.done.emit(False, f"Eroare la export: {exc}")
 
 class QuestionnaireDialog(QDialog):
     def __init__(self, data: dict, parent: Optional[QWidget] = None) -> None:
@@ -716,6 +740,9 @@ class MainWindow(QMainWindow):
         top.addSpacing(12)
         top.addWidget(self.push_check)
         top.addWidget(self.settings_button)
+        self.export_button = QPushButton("📦 Export .exe")
+        self.export_button.setToolTip("Generează executabil Windows (.exe) pentru C++, Java sau Python")
+        top.addWidget(self.export_button)
         top.addWidget(self.resume_button)
         top.addWidget(self.stop_button)
         root.addLayout(top)
@@ -841,6 +868,7 @@ class MainWindow(QMainWindow):
         self._update_temp()
         self.attach_button.clicked.connect(self._attach_files)
         self.clear_attach_btn.clicked.connect(self._clear_attachments)
+        self.export_button.clicked.connect(self._export_exe)
 
     def _restore(self) -> None:
         self._refresh_ollama_models()
@@ -911,6 +939,7 @@ class MainWindow(QMainWindow):
 
     def _on_type_changed(self, project_type: str) -> None:
         self.push_check.setEnabled(project_type == "Python")
+        self.export_button.setEnabled(project_type in {"Python", "C++", "Java"})
         self._persist_choice()
 
     def _refresh_ollama_models(self) -> None:
@@ -973,6 +1002,7 @@ class MainWindow(QMainWindow):
         self.attach_button.setEnabled(not running)
         self.clear_attach_btn.setEnabled((not running) and bool(self.attached_files))
         self.clarify_check.setEnabled(not running)
+        self.export_button.setEnabled((not running) and self.type_combo.currentText() in {"Python", "C++", "Java"})
         self.stop_button.setEnabled(running)
         if running:
             self.resume_button.setEnabled(False)
@@ -1176,6 +1206,23 @@ class MainWindow(QMainWindow):
             self.resume_button.setText("▶ Continuă")
             self.resume_button.setEnabled(False)
             self._sync_api_status()
+
+    def _export_exe(self) -> None:
+        if self.worker is not None and self.worker.isRunning():
+            return
+        project_dir = self.dir_edit.text().strip()
+        if not project_dir or not Path(project_dir).is_dir():
+            QMessageBox.warning(self, "Folder", "Alege un folder de proiect valid.")
+            return
+        project_type = self.type_combo.currentText()
+        self.cancel = threading.Event()
+        ew = ExportWorker(project_type, project_dir, self.session.entry_file, self.cancel)
+        ew.console.connect(self._on_console)
+        ew.done.connect(lambda ok, msg: (self._set_running(False), self._chat_add("Sistem", ("✅ " if ok else "⚠ ") + msg)))
+        self._export_worker = ew
+        self._set_running(True)
+        self._on_console(f"📦 Pornesc exportul Windows .exe ({project_type})…")
+        ew.start()
 
     def _resume(self) -> None:
         if self.worker is not None and self.worker.isRunning():
