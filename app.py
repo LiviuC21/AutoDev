@@ -171,6 +171,9 @@ class PipelineWorker(QThread):
     # ----- ciclu de viață -------------------------------------------------- #
     def run(self) -> None:
         try:
+            if self.session.architect is not None:
+                self.session.architect.on_status = self.console.emit
+                self.session.architect.on_quota_wait = self.qwen.unload
             problem = self.qwen.check_available()
             if problem:
                 raise AgentError(problem)
@@ -191,6 +194,9 @@ class PipelineWorker(QThread):
         except Exception as exc:  # noqa: BLE001
             self.console.emit("✘ Eroare neașteptată:\n" + traceback.format_exc())
             self.finished_run.emit(False, f"Eroare neașteptată: {exc}")
+        finally:
+            self.qwen.unload()
+            self.console.emit("🧹 Modelul local a fost eliberat din RAM.")
 
     def _check(self) -> None:
         if self.cancel.is_set():
@@ -768,10 +774,6 @@ class MainWindow(QMainWindow):
 
         self.api_check = QCheckBox("📡 API :8765")
         self.api_check.setToolTip("Pornește serverul API pentru telecomanda Android (Tailscale)")
-        bar2.addSpacing(14)
-        bar2.addWidget(self.api_check)
-        bar2.addStretch(1)
-        bar2.addWidget(self.temp_label)
 
         bar2.addWidget(QLabel("Model local (Ollama):"))
         bar2.addWidget(self.ollama_combo)
@@ -782,6 +784,8 @@ class MainWindow(QMainWindow):
         bar2.addSpacing(14)
         bar2.addWidget(QLabel("Thread-uri:"))
         bar2.addWidget(self.threads_spin)
+        bar2.addSpacing(14)
+        bar2.addWidget(self.api_check)
         bar2.addStretch(1)
         bar2.addWidget(self.temp_label)
         root.addLayout(bar2)
@@ -807,8 +811,7 @@ class MainWindow(QMainWindow):
         self.clarify_check = QCheckBox("📋 Chestionar de clarificare (înainte de plan)")
         self.clarify_check.setToolTip("Gemini îți pune 8-15 întrebări cu variante înainte să facă planul")
         self.send_button = QPushButton("Trimite către Gemini")
-
-        self.send_button = QPushButton("Trimite către Gemini")
+        
         left = QWidget()
         left_layout = QVBoxLayout(left)
         left_layout.setContentsMargins(0, 0, 0, 0)
@@ -816,7 +819,6 @@ class MainWindow(QMainWindow):
         left_layout.addWidget(self.input)
         left_layout.addLayout(attach_bar)
         left_layout.addWidget(self.clarify_check)
-        left_layout.addWidget(self.send_button)
         left_layout.addWidget(self.send_button)
 
         # Panoul 2: Gemini <-> Qwen
@@ -915,7 +917,7 @@ class MainWindow(QMainWindow):
             else:
                 color = "#c9ccd1"
             self._append(self.console_view, line, color)
-            self.remote_api.push_console_log(text)
+        self.remote_api.push_console_log(text)
 
     def _on_code_set(self, title: str, text: str) -> None:
         self.code_title.setText(f"Cod generat de Qwen — {title}")
