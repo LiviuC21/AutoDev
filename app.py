@@ -26,7 +26,7 @@ from PyQt6.QtWidgets import (
     QPushButton, QRadioButton, QScrollArea, QSpinBox, QSplitter, QTextEdit, QVBoxLayout, QListWidget, QWidget,
 )
 
-from agents import AgentError, GeminiArchitect, QwenWorker, list_ollama_models
+from agents import AgentError, GeminiArchitect, QwenWorker, list_ollama_models, sanity_problem
 from config import (
     GEMINI_MODELS, MAX_ATTEMPTS, PROJECT_TYPES, Cancelled, Settings,
     list_project_files, safe_join,
