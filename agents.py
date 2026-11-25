@@ -204,67 +204,80 @@ AUDIT_SCHEMA = """{
 }"""
 
 class GeminiArchitect:
-    """Arhitect și Reviewer bazat pe `google-genai`."""
+    """Arhitect și Reviewer bazat pe `google-genai` cu rotație automată de chei."""
 
-    def __init__(self, api_key: str, model: str = GEMINI_MODEL) -> None:
-        if not api_key:
-            raise AgentError("Lipsește GEMINI_API_KEY. Adaug-o din butonul Setări.")
-        self.client = genai.Client(api_key=api_key)
+    def __init__(self, api_key: str | list[str], model: str = GEMINI_MODEL) -> None:
+        if isinstance(api_key, str):
+            keys = [api_key.strip()] if api_key.strip() else []
+        else:
+            keys = [k.strip() for k in api_key if k and k.strip()]
+        if not keys:
+            raise AgentError("Lipsește GEMINI_API_KEY. Adaugă cel puțin o cheie din butonul Setări.")
+
+        self.api_keys: list[str] = keys
+        self.key_index: int = 0
+        self.client = genai.Client(api_key=self.api_keys[self.key_index])
         self.model = model
-        self.history: list[tuple[str, str]] = []  # (rol, text), rol = "user" | "model"
+        self.history: list[tuple[str, str]] = []
         self.on_status: Optional[Callable[[str], None]] = None
         self.on_quota_wait: Optional[Callable[[], None]] = None
 
-    # ----- apel de bază ---------------------------------------------------- #
-    def _contents(self, prompt: str, use_history: bool) -> list[types.Content]:
-        contents: list[types.Content] = []
-        if use_history:
-            for role, text in self.history[-MAX_HISTORY_PAIRS * 2:]:
-                contents.append(types.Content(role=role, parts=[types.Part(text=text)]))
-        contents.append(types.Content(role="user", parts=[types.Part(text=prompt)]))
-        return contents
+    def _switch_to_key(self, idx: int) -> None:
+        self.key_index = idx % len(self.api_keys)
+        self.client = genai.Client(api_key=self.api_keys[self.key_index])
 
     def _call_with_retry(self, contents: list[types.Content], config: types.GenerateContentConfig,
                          cancel: Optional[threading.Event]) -> str:
-        """Încearcă toate modelele; la 429/cotă așteaptă 60s, apoi intră în așteptare 15 min până revine cota."""
+        """Încearcă toate modelele pe cheia curentă, apoi rotește prin toate cheile API disponibile."""
         round_num = 0
         while True:
             round_num += 1
-            models_to_try = [self.model] + [m for m in GEMINI_MODELS if m != self.model]
-            for model_name in models_to_try:
-                _check_cancel(cancel)
-                try:
-                    response = run_cancellable(
-                        lambda m=model_name: self.client.models.generate_content(
-                            model=m, contents=contents, config=config),
-                        cancel,
-                    )
-                    if model_name != self.model and self.on_status:
-                        self.on_status(f"🔄 Gemini a trecut automat pe modelul: {model_name}")
-                    self.model = model_name
-                    return (response.text or "").strip()
-                except Cancelled:
-                    raise
-                except Exception as exc:  # noqa: BLE001
-                    msg = str(exc).lower()
-                    if any(k in msg for k in TRANSIENT_MARKERS):
-                        if self.on_status:
-                            self.on_status(f"⚠ Limită/eroare temporară pe {model_name}, încerc următorul model…")
-                        continue
-                    raise AgentError(f"Eroare Gemini ({model_name}): {exc}") from exc
+            keys_count = len(self.api_keys)
 
-            # Toate modelele au dat 429 / 503 în runda curentă
+            for offset in range(keys_count):
+                current_idx = (self.key_index + offset) % keys_count
+                if current_idx != self.key_index:
+                    self._switch_to_key(current_idx)
+                    if self.on_status:
+                        self.on_status(f"🔑 Am trecut automat pe cheia Gemini #{self.key_index + 1}/{keys_count}")
+
+                models_to_try = [self.model] + [m for m in GEMINI_MODELS if m != self.model]
+                for model_name in models_to_try:
+                    _check_cancel(cancel)
+                    try:
+                        response = run_cancellable(
+                            lambda m=model_name: self.client.models.generate_content(
+                                model=m, contents=contents, config=config),
+                            cancel,
+                        )
+                        if model_name != self.model and self.on_status:
+                            self.on_status(f"🔄 Gemini a trecut automat pe modelul: {model_name}")
+                        self.model = model_name
+                        return (response.text or "").strip()
+                    except Cancelled:
+                        raise
+                    except Exception as exc:  # noqa: BLE001
+                        msg = str(exc).lower()
+                        if any(k in msg for k in TRANSIENT_MARKERS):
+                            if self.on_status:
+                                self.on_status(
+                                    f"⚠ Limită/eroare pe {model_name} (cheia #{self.key_index + 1}), încerc următorul…"
+                                )
+                            continue
+                        raise AgentError(f"Eroare Gemini ({model_name}): {exc}") from exc
+
+            # Toate cheile și toate modelele au dat limită în runda curentă
             if round_num == 1:
                 wait_sec = 60
                 if self.on_status:
-                    self.on_status("⏳ Limită atinsă pe toate modelele Gemini. Aștept 60s și reîncerc automat…")
+                    self.on_status("⏳ Limită atinsă pe toate cheile Gemini. Aștept 60s și reîncerc automat…")
             else:
                 wait_sec = 900  # 15 minute
                 if self.on_quota_wait:
                     self.on_quota_wait()
                 if self.on_status:
                     self.on_status(
-                        "⏳ Cotă Gemini epuizată. Am eliberat RAM-ul Ollama și reîncerc automat peste 15 min (poți apăsa Stop oricând)…"
+                        "⏳ Cotă epuizată pe toate cheile. Am eliberat RAM-ul Ollama și reîncerc peste 15 min…"
                     )
             _sleep_cancellable(wait_sec, cancel)
 
