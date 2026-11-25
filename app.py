@@ -23,7 +23,7 @@ from PyQt6.QtGui import QColor, QKeySequence, QPalette, QShortcut, QTextCursor
 from PyQt6.QtWidgets import (
     QApplication, QButtonGroup, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog,
     QFormLayout, QFrame, QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMessageBox, QPlainTextEdit,
-    QPushButton, QRadioButton, QScrollArea, QSpinBox, QSplitter, QTextEdit, QVBoxLayout, QWidget,
+    QPushButton, QRadioButton, QScrollArea, QSpinBox, QSplitter, QTextEdit, QVBoxLayout, QListWidget, QWidget,
 )
 
 from agents import AgentError, GeminiArchitect, QwenWorker, list_ollama_models
@@ -629,50 +629,108 @@ class SettingsDialog(QDialog):
         super().__init__(parent)
         self.settings = settings
         self.setWindowTitle("Setări")
-        self.setMinimumWidth(460)
+        self.setMinimumWidth(520)
 
-        self.gemini_edit = QLineEdit(settings.gemini_api_key)
+        self._keys: list[str] = list(settings.gemini_api_keys)
+
+        # --- Secțiune Chei API Gemini (una câte una) ---
+        self.new_key_edit = QLineEdit()
+        self.new_key_edit.setPlaceholderText("Lipește o cheie Gemini API (AIza...) și apasă Adaugă")
+        self.new_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.add_key_btn = QPushButton("+ Adaugă")
+        self.add_key_btn.clicked.connect(self._add_key)
+        self.new_key_edit.returnPressed.connect(self._add_key)
+
+        add_row = QHBoxLayout()
+        add_row.addWidget(self.new_key_edit, 1)
+        add_row.addWidget(self.add_key_btn)
+
+        self.keys_list = QListWidget()
+        self.keys_list.setMaximumHeight(110)
+
+        self.remove_key_btn = QPushButton("Șterge cheia selectată")
+        self.remove_key_btn.clicked.connect(self._remove_selected_key)
+
+        keys_box = QVBoxLayout()
+        keys_box.addLayout(add_row)
+        keys_box.addWidget(self.keys_list)
+        keys_box.addWidget(self.remove_key_btn)
+
+        # --- Restul setărilor ---
         self.token_edit = QLineEdit(settings.github_token)
+        self.token_edit.setEchoMode(QLineEdit.EchoMode.Password)
         self.user_edit = QLineEdit(settings.github_username)
         self.private_check = QCheckBox("Repo privat pe GitHub")
         self.private_check.setChecked(settings.github_private)
         self.show_check = QCheckBox("Arată cheile")
-        for edit in (self.gemini_edit, self.token_edit):
-            edit.setEchoMode(QLineEdit.EchoMode.Password)
         self.show_check.toggled.connect(self._toggle_echo)
 
         form = QFormLayout()
-        form.addRow("Gemini API key:", self.gemini_edit)
+        form.addRow("Chei Gemini API:", keys_box)
         form.addRow("GitHub token:", self.token_edit)
         form.addRow("GitHub username:", self.user_edit)
         form.addRow("", self.private_check)
         form.addRow("", self.show_check)
 
-        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
-        buttons.accepted.connect(self.accept)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self._save_and_accept)
         buttons.rejected.connect(self.reject)
 
         layout = QVBoxLayout(self)
         layout.addLayout(form)
-        layout.addWidget(QLabel("Se salvează în fișierul .env (permisiuni 600)."))
         layout.addWidget(buttons)
 
-    def _toggle_echo(self, visible: bool) -> None:
-        mode = QLineEdit.EchoMode.Normal if visible else QLineEdit.EchoMode.Password
-        self.gemini_edit.setEchoMode(mode)
-        self.token_edit.setEchoMode(mode)
+        self._refresh_keys_list()
 
-    def accept(self) -> None:
-        self.settings.gemini_api_key = self.gemini_edit.text().strip()
+    def _mask_key(self, key: str) -> str:
+        if self.show_check.isChecked():
+            return key
+        if len(key) <= 10:
+            return "•" * len(key)
+        return f"{key[:6]}••••••••{key[-4:]}"
+
+    def _refresh_keys_list(self) -> None:
+        self.keys_list.clear()
+        for idx, k in enumerate(self._keys, 1):
+            self.keys_list.addItem(f"Cheia {idx}: {self._mask_key(k)}")
+
+    def _add_key(self) -> None:
+        key = self.new_key_edit.text().strip()
+        if not key:
+            return
+        if key in self._keys:
+            QMessageBox.information(self, "Duplicat", "Această cheie este deja în listă.")
+            return
+        self._keys.append(key)
+        self.new_key_edit.clear()
+        self._refresh_keys_list()
+
+    def _remove_selected_key(self) -> None:
+        row = self.keys_list.currentRow()
+        if 0 <= row < len(self._keys):
+            self._keys.pop(row)
+            self._refresh_keys_list()
+
+    def _toggle_echo(self, checked: bool) -> None:
+        mode = QLineEdit.EchoMode.Normal if checked else QLineEdit.EchoMode.Password
+        self.new_key_edit.setEchoMode(mode)
+        self.token_edit.setEchoMode(mode)
+        self._refresh_keys_list()
+
+    def _save_and_accept(self) -> None:
+        # Dacă ai lipit o cheie în câmp dar ai uitat să apeși "+ Adaugă", o adăugăm automat
+        pending = self.new_key_edit.text().strip()
+        if pending and pending not in self._keys:
+            self._keys.append(pending)
+        self.settings.gemini_api_keys = list(self._keys)
+        self.settings.gemini_api_key = self._keys[0] if self._keys else ""
         self.settings.github_token = self.token_edit.text().strip()
         self.settings.github_username = self.user_edit.text().strip()
         self.settings.github_private = self.private_check.isChecked()
-        try:
-            self.settings.save()
-        except OSError as exc:
-            QMessageBox.critical(self, "Eroare", f"Nu am putut salva .env: {exc}")
-            return
-        super().accept()
+        self.settings.save()
+        self.accept()
 
 
 # --------------------------------------------------------------------------- #
@@ -1011,21 +1069,22 @@ class MainWindow(QMainWindow):
         else:
             self._update_resume_button()
         self._sync_api_status()
-
-    def _ensure_session(self, project_dir: str, project_type: str) -> bool:
-        key = self.settings.gemini_api_key
+        
+     def _ensure_session(self, project_dir: str, project_type: str) -> bool:
+        keys = list(self.settings.gemini_api_keys)
+        keys_sig = ",".join(keys)
         gmodel = self.settings.gemini_model
         s = self.session
         if (s.architect is not None and s.project_dir == project_dir
-                and s.project_type == project_type and s.api_key == key
+                and s.project_type == project_type and s.api_key == keys_sig
                 and s.gemini_model == gmodel):
             return True
         try:
-            architect = GeminiArchitect(key, model=gmodel)
+            architect = GeminiArchitect(keys, model=gmodel)
         except AgentError as exc:
             QMessageBox.warning(self, "Gemini", str(exc))
             return False
-        self.session = Session(architect=architect, api_key=key, gemini_model=gmodel,
+        self.session = Session(architect=architect, api_key=keys_sig, gemini_model=gmodel,
                                project_dir=project_dir, project_type=project_type)
         return True
 
