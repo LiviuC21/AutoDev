@@ -251,6 +251,16 @@ class PipelineWorker(QThread):
         except (OSError, ValueError):
             return None
 
+    def _ask_gemini_hint(self, rel: str, question: str, requirements: str) -> str:
+        architect = self.session.architect
+        if architect is None:
+            return ""
+        self._check()
+        self.agent_log.emit(f"❓ Qwen întreabă pe Gemini ({rel}):\n{question}", "warn")
+        hint = architect.answer_hint(rel, question, requirements, self.project_type, self.cancel)
+        self.agent_log.emit(f"💡 Hint de la Gemini:\n{hint}", "info")
+        return hint
+
     # ----- un fișier: Qwen scrie -> salvare -> validare -> Gemini verifică -- #
     def _produce_file(self, step: dict) -> bool:
         rel = step["path"]
@@ -278,6 +288,7 @@ class PipelineWorker(QThread):
                 context=self._context_for(rel, deps),
                 project_map=pmap,
                 on_need_file=self._read_requested_file,
+                on_ask_gemini=lambda q: self._ask_gemini_hint(rel, q, step["requirements"]),
                 previous_code=last_code, feedback=feedback,
                 on_token=self._on_token, cancel=self.cancel,
             )
