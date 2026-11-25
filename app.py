@@ -1070,7 +1070,7 @@ class MainWindow(QMainWindow):
             self._update_resume_button()
         self._sync_api_status()
         
-     def _ensure_session(self, project_dir: str, project_type: str) -> bool:
+    def _ensure_session(self, project_dir: str, project_type: str) -> bool:
         keys = list(self.settings.gemini_api_keys)
         keys_sig = ",".join(keys)
         gmodel = self.settings.gemini_model
