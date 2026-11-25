@@ -281,6 +281,14 @@ class GeminiArchitect:
                     )
             _sleep_cancellable(wait_sec, cancel)
 
+    def _contents(self, prompt: str, use_history: bool) -> list[types.Content]:
+        items: list[types.Content] = []
+        if use_history:
+            for role, text in self.history:
+                items.append(types.Content(role=role, parts=[types.Part.from_text(text=text)]))
+        items.append(types.Content(role="user", parts=[types.Part.from_text(text=prompt)]))
+        return items
+
     def _generate(self, prompt: str, json_mode: bool, use_history: bool,
                   cancel: Optional[threading.Event]) -> str:
         contents = self._contents(prompt, use_history)
@@ -653,10 +661,15 @@ class QwenWorker:
                      context: Optional[dict[str, str]] = None,
                      project_map: Optional[str] = None,
                      previous_code: Optional[str] = None,
-                     feedback: Optional[str] = None) -> tuple[str, str]:
+                     feedback: Optional[str] = None,
+                     allow_need_file: bool = True) -> tuple[str, str]:
         """Construiește (system, prompt) încadrat în QWEN_PROMPT_CHAR_BUDGET."""
         is_edit = bool(previous_code and previous_code.strip())
         system_prompt = QWEN_EDIT_SYSTEM if is_edit else QWEN_SYSTEM
+        if not allow_need_file:
+            system_prompt = "\n".join(
+                line for line in system_prompt.splitlines() if "NEED_FILE:" not in line
+            )
 
         requirements = _clip(requirements, QWEN_PROMPT_CHAR_BUDGET // 3)
         head = f"Project type: {project_type}\nFile to write: {rel}\nRole: {description}\n\nRequirements:\n{requirements}\n"
@@ -665,10 +678,12 @@ class QwenWorker:
             head += f"\nProject files:\n{names}\n"
         if project_map:
             head += f"\nProject signatures map (other files):\n{_clip(project_map, 2500)}\n"
+
+        no_need_note = "" if allow_need_file else " Do NOT reply with NEED_FILE; write the code now."
         footer = (
-            f"\nReturn ONLY SEARCH/REPLACE blocks to update {rel}."
+            f"\nReturn ONLY SEARCH/REPLACE blocks to update {rel}.{no_need_note}"
             if is_edit
-            else f"\nReturn ONLY the complete content of {rel} in a single fenced code block."
+            else f"\nReturn ONLY the complete content of {rel} in a single fenced code block.{no_need_note}"
         )
 
         budget = QWEN_PROMPT_CHAR_BUDGET - len(system_prompt) - len(head) - len(footer) - 200
@@ -783,22 +798,46 @@ class QwenWorker:
                    feedback: Optional[str] = None,
                    on_token: Optional[Callable[[str], None]] = None,
                    cancel: Optional[threading.Event] = None) -> str:
-        """Generează conținutul complet al unui fișier, cu suport pentru cereri NEED_FILE."""
+        """Generează conținutul complet al unui fișier, cu suport sigur pentru cereri NEED_FILE."""
         ctx = dict(context or {})
+        unavailable: set[str] = set()
+        current_feedback = feedback or ""
         raw = ""
-        for _ in range(3):  # maxim 2 cereri NEED_FILE + generarea finală
+
+        for step in range(3):  # maxim 2 cereri NEED_FILE + generarea finală forțată
+            allow_need = (on_need_file is not None) and (step < 2)
             system, prompt = self.build_prompt(
                 rel, description, requirements, project_type,
-                project_files, ctx, project_map, previous_code, feedback,
+                project_files, ctx, project_map, previous_code,
+                current_feedback or None, allow_need_file=allow_need,
             )
             raw = self.generate(system, prompt, on_token, cancel)
-            requested = parse_need_file(raw) if on_need_file is not None else None
-            if requested and requested not in ctx:
+            requested = parse_need_file(raw)
+
+            if not requested:
+                break
+
+            if allow_need and requested != rel and requested not in ctx and requested not in unavailable:
                 extra = on_need_file(requested)
                 if extra is not None:
-                    ctx[requested] = extra
+                    # Punem fișierul cerut PRIMUL în context, ca să nu fie tăiat de buget
+                    ctx = {requested: extra, **ctx}
                     continue
+                unavailable.add(requested)
+
+            # Dacă fișierul nu există, e deja în context sau s-au epuizat cererile, forțăm generarea codului
+            note = f"\nFile '{requested}' is not available or already provided. Do NOT ask for files again; output the code now."
+            current_feedback = (current_feedback + note).strip()
+            system, prompt = self.build_prompt(
+                rel, description, requirements, project_type,
+                project_files, ctx, project_map, previous_code,
+                current_feedback, allow_need_file=False,
+            )
+            raw = self.generate(system, prompt, on_token, cancel)
             break
+
+        if parse_need_file(raw):
+            raise AgentError(f"Qwen a răspuns tot cu NEED_FILE ({parse_need_file(raw)}) în loc de cod.")
 
         if previous_code and previous_code.strip():
             code = apply_patches(previous_code, raw)
