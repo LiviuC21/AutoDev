@@ -638,12 +638,18 @@ def apply_patches(original: str, raw: str) -> str:
         raise PatchError("patch-ul șterge peste jumătate din fișier")
     return updated.strip("\n") + "\n"
 
-def sanity_problem(code: str) -> Optional[str]:
-    """Verifică rapid dacă codul generat conține erori evidente de structură/sintaxă."""
+def sanity_problem(code: str, rel: str = "") -> Optional[str]:
+    """Verifică rapid dacă codul generat are erori evidente de structură."""
     if not code or not code.strip():
         return "Codul generat este gol."
-    if "<<<<<<< SEARCH" in code or ">>>>>>> REPLACE" in code:
-        return "Răspunsul conține tag-uri SEARCH/REPLACE neaplicate."
+    if re.search(r"^(<<<<<<<|>>>>>>>|=======)", code, re.M):
+        return "Răspunsul conține tag-uri SEARCH/REPLACE sau markere de conflict."
+    if "```" in code and not rel.endswith(".md"):
+        return "Răspunsul conține fence-uri markdown (```)."
+    if re.match(r"\s*(NEED_FILE|ASK_GEMINI):", code):
+        return "Răspunsul este o cerere, nu cod."
+    if rel.endswith((".kt", ".java", ".kts", ".gradle")) and code.count("{") != code.count("}"):
+        return "Acolade neechilibrate: fișierul pare tăiat."
     return None
 
 _NEED_FILE_RE = re.compile(r"^\s*NEED_FILE:\s*([^\n\r`]+)", re.I)
@@ -724,9 +730,10 @@ class QwenWorker:
                      previous_code: Optional[str] = None,
                      feedback: Optional[str] = None,
                      allow_need_file: bool = True,
-                     allow_ask_gemini: bool = True) -> tuple[str, str]:
+                     allow_ask_gemini: bool = True,
+                     force_full: bool = False) -> tuple[str, str]:
         """Construiește (system, prompt) încadrat în QWEN_PROMPT_CHAR_BUDGET."""
-        is_edit = bool(previous_code and previous_code.strip())
+        is_edit = use_patch_mode(previous_code) and not force_full
         system_prompt = QWEN_EDIT_SYSTEM if is_edit else QWEN_SYSTEM
         if not allow_need_file:
             system_prompt = "\n".join(
@@ -763,7 +770,10 @@ class QwenWorker:
             budget -= len(feedback_text)
         previous_text = ""
         if previous_code:
-            previous_text = "\nCurrent version of the file:\n```\n" + _clip_middle(previous_code, max(500, int(budget * 0.5))) + "\n```\n"
+            label = ("Current version of the file:" if is_edit else
+                     "Previous version (faulty). Rewrite the WHOLE file from scratch and fix the issues. "
+                     "Do NOT output a diff or SEARCH/REPLACE blocks:")
+            previous_text = f"\n{label}\n```\n" + _clip_middle(previous_code, max(500, int(budget * 0.5))) + "\n```\n"
             budget -= len(previous_text)
         context_text = ""
         for path, code in (context or {}).items():
@@ -783,8 +793,11 @@ class QwenWorker:
         options: dict[str, Any] = {
             "num_ctx": QWEN_NUM_CTX,
             "num_predict": QWEN_NUM_PREDICT,
-            "temperature": 0.2,
+            "temperature": 0.1,
             "top_p": 0.9,
+            "top_k": 40,
+            "repeat_penalty": 1.05,
+            "repeat_last_n": 256,
         }
         if self.num_thread > 0:
             options["num_thread"] = self.num_thread
@@ -839,10 +852,11 @@ class QwenWorker:
                 piece = data.get("response", "")
                 if piece:
                     chunks.append(piece)
-                    if len(chunks) > 50 and len(set(chunks[-20:])) <= 2:
-                        self.last_looped = True
-                        response.close()
-                        break
+                    if len(chunks) % 100 == 0:
+                        text = "".join(chunks)
+                        if len(text) > 800 and text.count(text[-250:]) >= 2:  # același fragment de 2 ori
+                            self.last_looped = True
+                            break
                     if on_token is not None:
                         on_token(piece)
                 if data.get("done"):
@@ -932,7 +946,17 @@ class QwenWorker:
         if parse_need_files(raw) or parse_ask_gemini(raw):
             raise AgentError("Qwen nu a generat cod după clarificări.")
 
-        code = apply_patches(previous_code, raw) if (previous_code and previous_code.strip()) else extract_code(raw)
+        if use_patch_mode(previous_code):
+            try:
+                code = apply_patches(previous_code, raw)
+            except PatchError as exc:
+                note = f"{current_feedback}\nThe SEARCH/REPLACE attempt failed ({exc}). Return the complete file instead.".strip()
+                system, prompt = self.build_prompt(
+                    rel, description, requirements, project_type, project_files, ctx, project_map,
+                    previous_code, note, allow_need_file=False, allow_ask_gemini=False, force_full=True)
+                code = extract_code(self.generate(system, prompt, on_token, cancel))
+        else:
+            code = extract_code(raw)
         if not code.strip():
             raise AgentError("Qwen a returnat un răspuns gol.")
         return code
