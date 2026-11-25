@@ -181,6 +181,8 @@ class PipelineWorker(QThread):
                 ok, summary = self._build()
             elif self.mode == "resume":
                 ok, summary = self._resume()
+            elif self.mode == "audit":
+                ok, summary = self._audit()
             else:
                 ok, summary = self._feedback()
             self.finished_run.emit(ok, summary)
@@ -197,7 +199,7 @@ class PipelineWorker(QThread):
         finally:
             self.qwen.unload()
             self.console.emit("🧹 Modelul local a fost eliberat din RAM.")
-
+            
     def _check(self) -> None:
         if self.cancel.is_set():
             raise Cancelled()
@@ -501,6 +503,39 @@ class PipelineWorker(QThread):
         if failed:
             summary += " Neacceptate: " + ", ".join(failed) + "."
         summary += self._maybe_push("AutoDev Studio: modificări după feedback")
+        return not failed, summary
+
+    def _audit(self) -> tuple[bool, str]:
+        architect = self.session.architect
+        assert architect is not None
+        files = list_project_files(self.project_dir)
+        if not files:
+            return False, "Folderul proiectului este gol, nu există ce audita."
+
+        self.agent_log.emit("🔎 Gemini rulează auditul total pe toate fișierele proiectului…", "info")
+        audit = architect.audit(
+            self.text or "Verifică integritatea și funcționalitatea proiectului.",
+            self.project_type,
+            files,
+            self._read_files(files, 80000),
+            self.cancel,
+        )
+        self.chat_message.emit("Gemini (Audit)", audit["summary"])
+        tasks = audit.get("tasks", [])
+        if audit.get("ok") or not tasks:
+            self.agent_log.emit(f"✔ Audit finalizat: {audit['summary']}", "ok")
+            return True, "Auditul nu a găsit probleme de integrare sau fișiere gresite."
+
+        self.agent_log.emit(
+            "🛠 Auditul a identificat " + str(len(tasks)) + " fișier(e) de corectat/completat:\n"
+            + "\n".join(f"• {t['path']} — {t['description']}" for t in tasks),
+            "warn",
+        )
+        failed = self._run_steps(tasks)
+        summary = f"Audit & Reparații: {len(tasks) - len(failed)}/{len(tasks)} fișiere corectate cu succes."
+        if failed:
+            summary += " Eșuate: " + ", ".join(failed) + "."
+        summary += self._maybe_push("AutoDev Studio: reparații după auditul global")
         return not failed, summary
 
 # --------------------------------------------------------------------------- #
@@ -817,7 +852,11 @@ class MainWindow(QMainWindow):
         top.addWidget(self.settings_button)
         self.export_button = QPushButton("📦 Export .exe")
         self.export_button.setToolTip("Generează executabil Windows (.exe) pentru C++, Java sau Python")
+        # --- NOUL BUTON DE AUDIT / VERIFICARE TOTALĂ ---
+        self.audit_button = QPushButton("🔍 Verifică proiect")
+        self.audit_button.setToolTip("Rundează un audit global Gemini pe tot folderul și pune Qwen să repare fișierele cu probleme")
         top.addWidget(self.export_button)
+        top.addWidget(self.audit_button)
         top.addWidget(self.resume_button)
         top.addWidget(self.stop_button)
         root.addLayout(top)
@@ -940,6 +979,8 @@ class MainWindow(QMainWindow):
         self.attach_button.clicked.connect(self._attach_files)
         self.clear_attach_btn.clicked.connect(self._clear_attachments)
         self.export_button.clicked.connect(self._export_exe)
+        self.export_button.clicked.connect(self._export_exe)
+        self.audit_button.clicked.connect(self._audit_project)
 
     def _restore(self) -> None:
         self._refresh_ollama_models()
@@ -1070,6 +1111,8 @@ class MainWindow(QMainWindow):
         self.refresh_ollama_btn.setEnabled(not running)
         self.gemini_combo.setEnabled(not running)
         self.threads_spin.setEnabled(not running)
+        self.export_button.setEnabled((not running) and self.type_combo.currentText() in {"Python", "C++", "Java"})
+        self.audit_button.setEnabled(not running)
         self.attach_button.setEnabled(not running)
         self.clear_attach_btn.setEnabled((not running) and bool(self.attached_files))
         self.clarify_check.setEnabled(not running)
@@ -1327,6 +1370,30 @@ class MainWindow(QMainWindow):
         self._set_running(True)
         self._on_agent_log("━━ Reluare proiect din checkpoint ━━", "plan")
         worker.start()
+
+    def _audit_project(self) -> None:
+        if (self.worker is not None and self.worker.isRunning()) or (
+            self.clarify_worker is not None and self.clarify_worker.isRunning()
+        ):
+            return
+        if not self.settings.gemini_api_key:
+            QMessageBox.information(self, "Setări", "Adaugă mai întâi cheia Gemini API.")
+            self._open_settings()
+            if not self.settings.gemini_api_key:
+                return
+        project_dir = self.dir_edit.text().strip()
+        if not project_dir or not Path(project_dir).is_dir():
+            QMessageBox.warning(self, "Folder", "Alege un folder de proiect valid.")
+            return
+
+        project_type = self.type_combo.currentText()
+        if not self._ensure_session(project_dir, project_type):
+            return
+
+        self.input.clear()
+        self._clear_attachments()
+        self._chat_add("Tu", "🔍 Am cerut verificarea și repararea totală a proiectului.")
+        self._start_pipeline("audit", "Audit complet al tuturor fișierelor din proiect.", project_type)
 
     def _toggle_api(self, enabled: bool) -> None:
         if enabled:
