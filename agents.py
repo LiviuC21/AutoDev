@@ -508,8 +508,10 @@ File requirements:
 Qwen's question:
 {_clip(question, 1000)}
 
-Reply in ENGLISH with a short, direct, concrete technical hint (max 6 lines).
-Give exact names, signatures, or behavior. Do NOT write the whole file."""
+Rules:
+- Reply in ENGLISH with a short, direct technical hint (max 6 lines).
+- Be consistent with the file requirements above. Do NOT invent new class structures.
+- Do NOT write the whole file."""
         return self._generate(prompt, json_mode=False, use_history=False, cancel=cancel)
 
 # ----- review vizual (Vision) ------------------------------------------ #
