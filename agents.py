@@ -136,7 +136,7 @@ def _format_files(contents: Optional[dict[str, str]]) -> str:
 ARCHITECT_SYSTEM = """Ești Arhitectul software și Reviewer-ul unui sistem cu doi agenți.
 Un model local mic (Qwen2.5-Coder 7B) scrie codul, CÂTE UN FIȘIER PE RÂND, fără să vadă tot proiectul și
 cu un context foarte mic. De aceea:
-- împarți proiectul în fișiere mici, cu o singură responsabilitate (ideal sub ~200 de linii);
+- împarți proiectul în fișiere mici, cu o singură responsabilitate (maximum ~120 de linii; dacă depășește, împarte în mai multe fișiere);
 - pentru fiecare fișier scrii cerințe foarte concrete: nume exacte de clase/funcții/metode, semnături,
   importuri dintre fișiere, formate de date, comportament, tratarea erorilor;
 - ordonezi fișierele astfel încât fiecare să importe doar fișiere scrise înaintea lui.
@@ -559,6 +559,7 @@ Write comments and docstrings in Romanian; keep identifiers in English.
 If a previous version and review notes are provided, apply EVERY correction and return the whole corrected file.
 If you strictly need to inspect other project files not shown in context, reply ONLY with: NEED_FILE: path1, path2
 If a requirement or signature is unclear, reply ONLY with: ASK_GEMINI: <one short technical question>
+Never output diffs, SEARCH/REPLACE blocks or partial files.
 """
 
 _FENCE_RE = re.compile(r"```[ \t]*[\w+#.\-]*[ \t]*\n(.*?)```", re.S)
