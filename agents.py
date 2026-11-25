@@ -699,7 +699,8 @@ class QwenWorker:
                      project_map: Optional[str] = None,
                      previous_code: Optional[str] = None,
                      feedback: Optional[str] = None,
-                     allow_need_file: bool = True) -> tuple[str, str]:
+                     allow_need_file: bool = True,
+                     allow_ask_gemini: bool = True) -> tuple[str, str]:
         """Construiește (system, prompt) încadrat în QWEN_PROMPT_CHAR_BUDGET."""
         is_edit = bool(previous_code and previous_code.strip())
         system_prompt = QWEN_EDIT_SYSTEM if is_edit else QWEN_SYSTEM
@@ -749,7 +750,6 @@ class QwenWorker:
             context_text += chunk
             budget -= len(chunk)
         return system_prompt, head + context_text + previous_text + feedback_text + footer
-
     # ----- generare -------------------------------------------------------- #
     def generate(self, system: str, prompt: str, on_token: Optional[Callable[[str], None]] = None,
                  cancel: Optional[threading.Event] = None) -> str:
