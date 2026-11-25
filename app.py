@@ -299,6 +299,13 @@ class PipelineWorker(QThread):
             if self.qwen.last_truncated:
                 self.console.emit("⚠ Răspunsul lui Qwen a atins limita QWEN_NUM_PREDICT și poate fi incomplet.")
 
+            prob = sanity_problem(code)
+            if prob:
+                self.console.emit(f"⚠ Sanity check eșuat: {prob}")
+                feedback = f"Sanity check failed: {prob}. Please rewrite the entire file correctly."
+                last_code = code
+                continue
+
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(code, encoding="utf-8")
             self.console.emit(f"💾 Salvat: {rel} ({len(code.splitlines())} linii)")
