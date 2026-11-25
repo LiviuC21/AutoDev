@@ -496,6 +496,22 @@ Răspunde DOAR cu JSON valid, exact în această schemă:
         )
         return {"ok": ok, "summary": summary, "tasks": tasks}
 
+    # ----- hint rapid pentru Qwen (ASK_GEMINI) ----------------------------- #
+    def answer_hint(self, rel: str, question: str, requirements: str, project_type: str,
+                    cancel: Optional[threading.Event] = None) -> str:
+        """Răspunde scurt și tehnic în engleză la o întrebare punctuală a lui Qwen."""
+        prompt = f"""The local coding model (Qwen) is writing `{rel}` ({project_type}) and asks for clarification.
+
+File requirements:
+{_clip(requirements, 3000)}
+
+Qwen's question:
+{_clip(question, 1000)}
+
+Reply in ENGLISH with a short, direct, concrete technical hint (max 6 lines).
+Give exact names, signatures, or behavior. Do NOT write the whole file."""
+        return self._generate(prompt, json_mode=False, use_history=False, cancel=cancel)
+
 # ----- review vizual (Vision) ------------------------------------------ #
     def review_screenshot(self, image_path: Path, app_goal: str,
                           cancel: Optional[threading.Event] = None) -> tuple[str, str]:
@@ -539,7 +555,9 @@ Use the exact names, imports and signatures given in the requirements and in the
 Do not import modules that are not part of the project or the standard library unless the requirements list them.
 Write comments and docstrings in Romanian; keep identifiers in English.
 If a previous version and review notes are provided, apply EVERY correction and return the whole corrected file.
-If you strictly need to inspect the full code of another project file not shown in context, reply ONLY with: NEED_FILE: path/to/file"""
+If you strictly need to inspect other project files not shown in context, reply ONLY with: NEED_FILE: path1, path2
+If a requirement or signature is unclear, reply ONLY with: ASK_GEMINI: <one short technical question>
+"""
 
 _FENCE_RE = re.compile(r"```[ \t]*[\w+#.\-]*[ \t]*\n(.*?)```", re.S)
 
@@ -580,7 +598,9 @@ Rules:
 - Copy the SEARCH lines EXACTLY as they appear in the current file (same indentation and spacing).
 - Keep SEARCH blocks short (3-10 lines of context) so they match uniquely.
 - Never output the whole file unless every single line changes. No explanations outside the blocks.
-- If you strictly need to inspect another project file not shown in context, reply ONLY with: NEED_FILE: path/to/file"""
+- If you strictly need to inspect other project files not shown in context, reply ONLY with: NEED_FILE: path1, path2
+- If a requirement or signature is unclear, reply ONLY with: ASK_GEMINI: <one short technical question>
+"""
 
 _PATCH_RE = re.compile(
     r"<<<<<<< SEARCH\s*\n(.*?)\n=======\s*\n(.*?)\n>>>>>>> REPLACE",
@@ -604,15 +624,32 @@ def apply_patches(original: str, raw: str) -> str:
     return updated.strip("\n") + "\n"
 
 _NEED_FILE_RE = re.compile(r"^\s*NEED_FILE:\s*([^\n\r`]+)", re.I)
+_ASK_GEMINI_RE = re.compile(r"^\s*ASK_GEMINI:\s*(.+)", re.I | re.S)
 
 
-def parse_need_file(raw: str) -> Optional[str]:
-    """Returnează calea cerută dacă modelul a răspuns cu `NEED_FILE: ...`, altfel None."""
+def parse_need_files(raw: str) -> list[str]:
+    """Returnează lista de căi cerute prin `NEED_FILE: a.py, b.py`, sau []."""
     cleaned = raw.strip()
-    if len(cleaned) > 300:
-        return None
+    if len(cleaned) > 400:
+        return []
     match = _NEED_FILE_RE.match(cleaned)
-    return normalize_rel(match.group(1)) if match else None
+    if not match:
+        return []
+    parts = re.split(r"[,;]+", match.group(1))
+    result: list[str] = []
+    for p in parts:
+        norm = normalize_rel(p)
+        if norm and norm not in result:
+            result.append(norm)
+    return result
+
+def parse_ask_gemini(raw: str) -> Optional[str]:
+    """Returnează întrebarea dacă Qwen a răspuns cu `ASK_GEMINI: ...`, altfel None."""
+    cleaned = raw.strip()
+    if len(cleaned) > 600 or "```" in cleaned:
+        return None
+    match = _ASK_GEMINI_RE.match(cleaned)
+    return match.group(1).strip() if match else None
 
 def list_ollama_models(base_url: str = OLLAMA_URL) -> list[str]:
     """Returnează lista modelelor instalate local în Ollama."""
@@ -670,6 +707,10 @@ class QwenWorker:
             system_prompt = "\n".join(
                 line for line in system_prompt.splitlines() if "NEED_FILE:" not in line
             )
+        if not allow_ask_gemini:
+            system_prompt = "\n".join(
+                line for line in system_prompt.splitlines() if "ASK_GEMINI:" not in line
+            )
 
         requirements = _clip(requirements, QWEN_PROMPT_CHAR_BUDGET // 3)
         head = f"Project type: {project_type}\nFile to write: {rel}\nRole: {description}\n\nRequirements:\n{requirements}\n"
@@ -679,7 +720,11 @@ class QwenWorker:
         if project_map:
             head += f"\nProject signatures map (other files):\n{_clip(project_map, 2500)}\n"
 
-        no_need_note = "" if allow_need_file else " Do NOT reply with NEED_FILE; write the code now."
+        no_need_note = (
+            ""
+            if (allow_need_file or allow_ask_gemini)
+            else " Do NOT reply with NEED_FILE or ASK_GEMINI; write the code now."
+        )
         footer = (
             f"\nReturn ONLY SEARCH/REPLACE blocks to update {rel}.{no_need_note}"
             if is_edit
@@ -794,55 +839,71 @@ class QwenWorker:
                    context: Optional[dict[str, str]] = None,
                    project_map: Optional[str] = None,
                    on_need_file: Optional[Callable[[str], Optional[str]]] = None,
+                   on_ask_gemini: Optional[Callable[[str], str]] = None,
                    previous_code: Optional[str] = None,
                    feedback: Optional[str] = None,
                    on_token: Optional[Callable[[str], None]] = None,
                    cancel: Optional[threading.Event] = None) -> str:
-        """Generează conținutul complet al unui fișier, cu suport sigur pentru cereri NEED_FILE."""
+        """Generează conținutul unui fișier, cu suport pentru NEED_FILE multiplu și ASK_GEMINI."""
         ctx = dict(context or {})
         unavailable: set[str] = set()
         current_feedback = feedback or ""
         raw = ""
+        file_asks = 0
+        gemini_asks = 0
 
-        for step in range(3):  # maxim 2 cereri NEED_FILE + generarea finală forțată
-            allow_need = (on_need_file is not None) and (step < 2)
+        for _ in range(5):  # maxim 2 runde NEED_FILE + 2 runde ASK_GEMINI + generarea finală
+            allow_need = (on_need_file is not None) and (file_asks < 2)
+            allow_ask = (on_ask_gemini is not None) and (gemini_asks < 2)
+
             system, prompt = self.build_prompt(
                 rel, description, requirements, project_type,
                 project_files, ctx, project_map, previous_code,
-                current_feedback or None, allow_need_file=allow_need,
+                current_feedback or None,
+                allow_need_file=allow_need,
+                allow_ask_gemini=allow_ask,
             )
             raw = self.generate(system, prompt, on_token, cancel)
-            requested = parse_need_file(raw)
 
-            if not requested:
-                break
+            # 1) Verifică dacă Qwen cere fișiere
+            requested_files = parse_need_files(raw)
+            if requested_files:
+                if allow_need:
+                    file_asks += 1
+                    added = False
+                    for req in requested_files[:3]:
+                        if req != rel and req not in ctx and req not in unavailable:
+                            extra = on_need_file(req)
+                            if extra is not None:
+                                ctx = {req: extra, **ctx}
+                                added = True
+                            else:
+                                unavailable.add(req)
+                    if added:
+                        continue
+                note = f"\nRequested files ({', '.join(requested_files)}) are unavailable or already shown. Write the code now."
+                current_feedback = (current_feedback + note).strip()
+                continue
 
-            if allow_need and requested != rel and requested not in ctx and requested not in unavailable:
-                extra = on_need_file(requested)
-                if extra is not None:
-                    # Punem fișierul cerut PRIMUL în context, ca să nu fie tăiat de buget
-                    ctx = {requested: extra, **ctx}
-                    continue
-                unavailable.add(requested)
+            # 2) Verifică dacă Qwen pune o întrebare lui Gemini
+            question = parse_ask_gemini(raw)
+            if question:
+                if allow_ask:
+                    gemini_asks += 1
+                    hint = on_ask_gemini(question)
+                    if hint:
+                        current_feedback = (current_feedback + f"\n\nGemini clarification:\n{hint}").strip()
+                        continue
+                current_feedback = (current_feedback + "\nDo NOT ask more questions; output the code now.").strip()
+                continue
 
-            # Dacă fișierul nu există, e deja în context sau s-au epuizat cererile, forțăm generarea codului
-            note = f"\nFile '{requested}' is not available or already provided. Do NOT ask for files again; output the code now."
-            current_feedback = (current_feedback + note).strip()
-            system, prompt = self.build_prompt(
-                rel, description, requirements, project_type,
-                project_files, ctx, project_map, previous_code,
-                current_feedback, allow_need_file=False,
-            )
-            raw = self.generate(system, prompt, on_token, cancel)
+            # 3) A generat cod
             break
 
-        if parse_need_file(raw):
-            raise AgentError(f"Qwen a răspuns tot cu NEED_FILE ({parse_need_file(raw)}) în loc de cod.")
+        if parse_need_files(raw) or parse_ask_gemini(raw):
+            raise AgentError("Qwen nu a generat cod după clarificări.")
 
-        if previous_code and previous_code.strip():
-            code = apply_patches(previous_code, raw)
-        else:
-            code = extract_code(raw)
+        code = apply_patches(previous_code, raw) if (previous_code and previous_code.strip()) else extract_code(raw)
         if not code.strip():
             raise AgentError("Qwen a returnat un răspuns gol.")
         return code
