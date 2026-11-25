@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 APP_DIR = Path(__file__).resolve().parent
@@ -81,6 +81,7 @@ def write_env_values(updates: dict[str, str]) -> None:
 @dataclass
 class Settings:
     gemini_api_key: str = ""
+    gemini_api_keys: list[str] = field(default_factory=list)
     github_token: str = ""
     github_username: str = ""
     github_private: bool = True
@@ -97,6 +98,13 @@ class Settings:
         def pick(key: str) -> str:
             return values.get(key) or os.environ.get(key, "")
 
+        # Încărcăm lista de chei (separate prin virgulă) sau cheia veche
+        raw_keys = pick("GEMINI_API_KEYS")
+        keys = [k.strip() for k in raw_keys.split(",") if k.strip()]
+        legacy_key = pick("GEMINI_API_KEY").strip()
+        if legacy_key and legacy_key not in keys:
+            keys.insert(0, legacy_key)
+
         last_type = values.get("LAST_PROJECT_TYPE", "Python")
         gemini_model = values.get("GEMINI_MODEL", GEMINI_MODEL)
         try:
@@ -105,7 +113,8 @@ class Settings:
             threads = QWEN_NUM_THREAD
 
         return cls(
-            gemini_api_key=pick("GEMINI_API_KEY"),
+            gemini_api_key=keys[0] if keys else "",
+            gemini_api_keys=keys,
             github_token=pick("GITHUB_TOKEN"),
             github_username=pick("GITHUB_USERNAME"),
             github_private=values.get("GITHUB_PRIVATE", "true").lower() != "false",
@@ -117,8 +126,12 @@ class Settings:
         )
 
     def save(self) -> None:
+        clean_keys = [k.strip() for k in self.gemini_api_keys if k.strip()]
+        self.gemini_api_keys = clean_keys
+        self.gemini_api_key = clean_keys[0] if clean_keys else ""
         write_env_values({
             "GEMINI_API_KEY": self.gemini_api_key,
+            "GEMINI_API_KEYS": ",".join(clean_keys),
             "GITHUB_TOKEN": self.github_token,
             "GITHUB_USERNAME": self.github_username,
             "GITHUB_PRIVATE": "true" if self.github_private else "false",
