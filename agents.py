@@ -609,21 +609,42 @@ _PATCH_RE = re.compile(
     re.S,
 )
 
+EDIT_MODE_MIN_LINES = 200  # sub prag, Qwen rescrie tot fișierul
+
+class PatchError(Exception):
+    """Patch SEARCH/REPLACE invalid sau periculos."""
+
+
+def use_patch_mode(previous_code: Optional[str]) -> bool:
+    return bool(previous_code and previous_code.strip()
+                and len(previous_code.splitlines()) >= EDIT_MODE_MIN_LINES)
+
 
 def apply_patches(original: str, raw: str) -> str:
-    """Aplică blocurile SEARCH/REPLACE pe fișierul existent. Fallback la cod complet dacă nu există blocuri."""
-    patches = _PATCH_RE.findall(raw.replace("\r\n", "\n"))
+    patches = list(dict.fromkeys(_PATCH_RE.findall(raw.replace("\r\n", "\n"))))  # dedup bucla
     if not patches:
-        # Plasă de siguranță: dacă Qwen a rescris tot fișierul în loc de patch, îl folosim normal.
         return extract_code(raw)
-
     updated = original.replace("\r\n", "\n")
-    for search_block, replace_block in patches:
+    for i, (search_block, replace_block) in enumerate(patches, 1):
+        if not search_block.strip():
+            raise PatchError(f"blocul {i}: SEARCH gol")
         if search_block in updated:
             updated = updated.replace(search_block, replace_block, 1)
-        elif search_block.strip() and search_block.strip() in updated:
+        elif search_block.strip() in updated:
             updated = updated.replace(search_block.strip(), replace_block.strip(), 1)
+        else:
+            raise PatchError(f"blocul {i} nu se potrivește cu fișierul")
+    if len(original) > 400 and len(updated.strip()) < 0.5 * len(original.strip()):
+        raise PatchError("patch-ul șterge peste jumătate din fișier")
     return updated.strip("\n") + "\n"
+
+def sanity_problem(code: str) -> Optional[str]:
+    """Verifică rapid dacă codul generat conține erori evidente de structură/sintaxă."""
+    if not code or not code.strip():
+        return "Codul generat este gol."
+    if "<<<<<<< SEARCH" in code or ">>>>>>> REPLACE" in code:
+        return "Răspunsul conține tag-uri SEARCH/REPLACE neaplicate."
+    return None
 
 _NEED_FILE_RE = re.compile(r"^\s*NEED_FILE:\s*([^\n\r`]+)", re.I)
 _ASK_GEMINI_RE = re.compile(r"^\s*ASK_GEMINI:\s*(.+)", re.I | re.S)
@@ -670,6 +691,7 @@ class QwenWorker:
         self.model = model
         self.num_thread = num_thread
         self.last_truncated = False
+        self.last_looped = False
 
     def check_available(self) -> Optional[str]:
         """Returnează un mesaj de eroare dacă Ollama/modelul nu sunt disponibile, altfel None."""
@@ -757,6 +779,7 @@ class QwenWorker:
                  cancel: Optional[threading.Event] = None) -> str:
         _check_cancel(cancel)
         self.last_truncated = False
+        self.last_looped = False
         options: dict[str, Any] = {
             "num_ctx": QWEN_NUM_CTX,
             "num_predict": QWEN_NUM_PREDICT,
@@ -816,6 +839,10 @@ class QwenWorker:
                 piece = data.get("response", "")
                 if piece:
                     chunks.append(piece)
+                    if len(chunks) > 50 and len(set(chunks[-20:])) <= 2:
+                        self.last_looped = True
+                        response.close()
+                        break
                     if on_token is not None:
                         on_token(piece)
                 if data.get("done"):
